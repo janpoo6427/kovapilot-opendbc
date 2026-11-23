@@ -69,10 +69,29 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   const unsigned pt_bus = safety_setup.hyundai_canfd_lka_steer_msg ? 1U : 0U;
   const unsigned int scc_bus = safety_setup.hyundai_camera_scc ? 2U : pt_bus;
 
+  if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0xCBU, 2U)) {
+    for (uint8_t i = 7U; i < 24U; i++) {
+      safety.hyundai_angle_stock_lfa[i - 7U] = msg->data[i];
+    }
+    safety.hyundai_angle_stock_lfa_valid = true;
+  }
+
   // driver torque
   if (msg_matches(msg, 0xeaU, pt_bus)) {
     int torque_driver_new = from_offset(GET_BYTES_LE(msg, 10, 2) & 0x1FFFU, 4095);
     update_sample(&safety.torque_driver, torque_driver_new);
+
+    if (safety_setup.hyundai_canfd_angle_steering) {
+      const uint16_t raw_angle = GET_BYTES_LE(msg, 16, 2);
+      const bool valid_angle = (raw_angle != 0x7FFEU) && (raw_angle != 0x7FFFU);
+      const bool mdps_fault = ((msg->data[3] & 0x7U) != 0U) || (((msg->data[6] >> 6U) & 0x3U) != 0U) ||
+                              (((msg->data[15] >> 6U) & 0x3U) != 0U) || (((msg->data[18] >> 4U) & 0x7U) != 0U);
+      if (valid_angle && !mdps_fault) {
+        update_sample(&safety.angle_meas, to_signed(raw_angle, 16));
+      } else {
+        safety.controls_allowed = false;
+      }
+    }
   }
 
   // cruise buttons
@@ -114,6 +133,10 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     uint32_t rr = (GET_BYTES_LE(msg, 14, 2)) & 0x3FFFU;
     safety.vehicle_moving = (fl > HYUNDAI_STANDSTILL_THRSLD) || (fr > HYUNDAI_STANDSTILL_THRSLD) ||
                      (rl > HYUNDAI_STANDSTILL_THRSLD) || (rr > HYUNDAI_STANDSTILL_THRSLD);
+    if (safety_setup.hyundai_canfd_angle_steering) {
+      const float speed_kph = ((float)(fl + fr + rl + rr) / 4.0f) * 0.03125f;
+      UPDATE_VEHICLE_SPEED(speed_kph * KPH_TO_MS);
+    }
   }
 
   // cruise state
@@ -144,6 +167,64 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   };
 
   bool tx = true;
+
+  const AngleSteeringLimits HYUNDAI_CANFD_ANGLE_LIMITS = {
+    .max_angle = 1750,
+    .angle_deg_to_can = 10.0f,
+    .angle_rate_up_lookup = {
+      {0.0f, 5.0f, 25.0f},
+      {1.2f, 0.8f, 0.2f},
+    },
+    .angle_rate_down_lookup = {
+      {0.0f, 5.0f, 25.0f},
+      {1.5f, 1.0f, 0.3f},
+    },
+    .frequency = 100U,
+  };
+
+  if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0xCBU, 0U)) {
+    const int desired_angle = to_signed(GET_BYTES_LE(msg, 4, 2) & 0x3FFFU, 14);
+    const uint8_t state = msg->data[3] >> 4U;
+    const bool steer_control_enabled = state == 2U;
+    const uint8_t gain = msg->data[6];
+    const uint8_t counter = msg->data[2];
+    bool stock_payload_matches = safety.hyundai_angle_stock_lfa_valid && ((msg->data[3] & 0xFU) == 0U);
+    for (uint8_t i = 7U; i < 24U; i++) {
+      stock_payload_matches = stock_payload_matches && (msg->data[i] == safety.hyundai_angle_stock_lfa[i - 7U]);
+    }
+
+    const bool state_violation = steer_control_enabled ? (gain != 250U) : ((state != 1U) || (gain != 0U));
+    const bool active_angle_violation = steer_control_enabled &&
+                                        ((safety_abs_int(desired_angle) > 600) ||
+                                         (safety.angle_meas.min <= -600) || (safety.angle_meas.max >= 600));
+    const bool driver_override = steer_control_enabled &&
+                                 ((safety.torque_driver.min < -250) || (safety.torque_driver.max > 250));
+    const bool angle_violation = steer_angle_cmd_checks(desired_angle, steer_control_enabled, HYUNDAI_CANFD_ANGLE_LIMITS) ||
+                                 safety_max_limit_check(desired_angle, HYUNDAI_CANFD_ANGLE_LIMITS.max_angle,
+                                                       -HYUNDAI_CANFD_ANGLE_LIMITS.max_angle);
+    const bool measured_error = steer_control_enabled &&
+                                safety_max_limit_check(desired_angle, safety.angle_meas.max + 100, safety.angle_meas.min - 100);
+    const bool frequency_violation = rt_angle_rate_limit_check(HYUNDAI_CANFD_ANGLE_LIMITS);
+    const bool checksum_violation = hyundai_canfd_get_checksum(msg) != hyundai_common_canfd_compute_checksum(msg);
+    const bool counter_violation = safety.hyundai_angle_tx_counter_valid &&
+                                   (counter != ((safety.hyundai_angle_tx_counter + 1U) & 0xFFU));
+    if (state_violation || active_angle_violation || driver_override || angle_violation || measured_error ||
+        frequency_violation || checksum_violation || counter_violation || !stock_payload_matches) {
+      tx = false;
+      // Protocol, measurement, and frequency failures happen outside the
+      // generic angle helper. Do not let a rejected frame advance its rate
+      // limiter state and authorize a later jump.
+      safety.desired_angle_last = safety_clamp_int(safety.angle_meas.values[0],
+                                                   -HYUNDAI_CANFD_ANGLE_LIMITS.max_angle,
+                                                   HYUNDAI_CANFD_ANGLE_LIMITS.max_angle);
+    }
+    // Resynchronize after a valid-CRC counter jump so one rejected request
+    // cannot permanently lock out a correctly incrementing controller.
+    if (!checksum_violation) {
+      safety.hyundai_angle_tx_counter = counter;
+      safety.hyundai_angle_tx_counter_valid = true;
+    }
+  }
 
   // steering
   const unsigned int steer_addr = (safety_setup.hyundai_canfd_lka_steer_msg && !safety_setup.hyundai_longitudinal) ? hyundai_canfd_get_lka_addr() : 0x12aU;
@@ -209,6 +290,7 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 static safety_config hyundai_canfd_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT = 128;
   const uint16_t HYUNDAI_PARAM_CANFD_ALT_BUTTONS = 32;
+  const uint16_t HYUNDAI_PARAM_CANFD_ANGLE_STEERING = 1024;
 
   static const CanMsg HYUNDAI_CANFD_LKA_STEER_MSG_TX_MSGS[] = {
     HYUNDAI_CANFD_LKA_STEER_MSG_COMMON_TX_MSGS(0, 1)
@@ -237,6 +319,15 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     HYUNDAI_CANFD_SCC_CONTROL_COMMON_TX_MSGS(0, false)
   };
 
+  static const CanMsg HYUNDAI_CANFD_ANGLE_STEERING_TX_MSGS[] = {
+    {0xCB, 0, 24, .check_relay = true},  // LFA_ALT
+  };
+
+  static const CanMsg HYUNDAI_CANFD_ANGLE_STEERING_LONG_TX_MSGS[] = {
+    {0xCB,  0, 24, .check_relay = true},  // LFA_ALT
+    {0x1A0, 0, 32, .check_relay = true},  // SCC_CONTROL
+  };
+
   // ADRV_0x160 is checked for radar liveness
   static const CanMsg HYUNDAI_CANFD_LFA_STEERING_LONG_TX_MSGS[] = {
     HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(2)
@@ -257,9 +348,27 @@ static safety_config hyundai_canfd_init(uint16_t param) {
 
   safety_setup.hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
   safety_setup.hyundai_canfd_lka_steer_msg_alt = GET_FLAG(param, HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT);
+  safety_setup.hyundai_canfd_angle_steering = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ANGLE_STEERING);
+
+  if (safety_setup.hyundai_canfd_angle_steering &&
+      (!safety_setup.hyundai_camera_scc || safety_setup.hyundai_canfd_lka_steer_msg || safety_setup.hyundai_canfd_alt_buttons ||
+       !safety_setup.hyundai_ev_gas_signal)) {
+    return (safety_config){NULL, 0, NULL, 0, true};  // NOLINT(readability/braces)
+  }
 
   safety_config ret;
-  if (safety_setup.hyundai_longitudinal) {
+  if (safety_setup.hyundai_canfd_angle_steering) {
+    static const RxCheck hyundai_canfd_angle_rx_checks[] = {
+      HYUNDAI_CANFD_STD_BUTTONS_RX_CHECKS(0)
+      HYUNDAI_CANFD_SCC_ADDR_CHECK(2)
+      {.msg = {{0xCB, 2, 24, 100U, .max_counter = 0xffU, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    };
+    if (safety_setup.hyundai_longitudinal) {
+      ret = BUILD_SAFETY_CFG(hyundai_canfd_angle_rx_checks, HYUNDAI_CANFD_ANGLE_STEERING_LONG_TX_MSGS);
+    } else {
+      ret = BUILD_SAFETY_CFG(hyundai_canfd_angle_rx_checks, HYUNDAI_CANFD_ANGLE_STEERING_TX_MSGS);
+    }
+  } else if (safety_setup.hyundai_longitudinal) {
     if (safety_setup.hyundai_canfd_lka_steer_msg) {
       static const RxCheck hyundai_canfd_lka_steer_msg_long_rx_checks[] = {
         HYUNDAI_CANFD_STD_BUTTONS_RX_CHECKS(1)

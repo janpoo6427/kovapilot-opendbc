@@ -56,6 +56,7 @@ class CarState(CarStateBase):
     self.buttons_counter = 0
 
     self.cruise_info = {}
+    self.lfa_alt = {}
 
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
@@ -236,6 +237,10 @@ class CarState(CarStateBase):
 
     ret.steeringRateDeg = cp.vl["STEERING_SENSORS"]["STEERING_RATE"]
     ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEERING_ANGLE"]
+    if self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      # LFA_ALT is consumed by MDPS, and panda safety validates against the
+      # same compensated MDPS angle. Keep controller and safety in one domain.
+      ret.steeringAngleDeg = cp.vl["MDPS"]["MDPS_EstStrAnglVal"]
     ret.steeringTorque = cp.vl["MDPS"]["MDPS_StrTqSnsrVal"]
     ret.steeringTorqueEps = cp.vl["MDPS"]["MDPS_OutTqVal"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > self.params.STEER_THRESHOLD, 5)
@@ -284,6 +289,8 @@ class CarState(CarStateBase):
     if self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG:
       self.lfa_block_msg = copy.copy(cp_cam.vl["CAM_0x362"] if self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG_ALT
                                           else cp_cam.vl["CAM_0x2a4"])
+    if self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      self.lfa_alt = copy.copy(cp_cam.vl["LFA_ALT"])
 
     ret.buttonEvents = [*create_button_events(self.cruise_buttons[-1], prev_cruise_buttons, BUTTONS_DICT),
                         *create_button_events(self.main_buttons[-1], prev_main_buttons, {1: ButtonType.mainCruise}),
@@ -301,9 +308,12 @@ class CarState(CarStateBase):
         # this message is 50Hz but the ECU frequently stops transmitting for ~0.5s
         ("CRUISE_BUTTONS", 1)
       ]
+    cam_msgs = []
+    if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      cam_msgs.append(("LFA_ALT", 100))
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
+      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_msgs, CanBus(CP).CAM),
     }
 
   def get_can_parsers(self, CP):

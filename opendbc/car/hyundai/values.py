@@ -7,6 +7,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.structs import CarParams
 from opendbc.car.docs_definitions import CarHarness, CarDocs, CarParts
 from opendbc.car.fw_query_definitions import FwQueryConfig, Request, p16
+from opendbc.car.lateral import AngleSteeringLimits
 
 Ecu = CarParams.Ecu
 
@@ -14,6 +15,11 @@ Ecu = CarParams.Ecu
 class CarControllerParams:
   ACCEL_MIN = -3.5 # m/s^2
   ACCEL_MAX = 2.0 # m/s^2
+  ANGLE_LIMITS = AngleSteeringLimits(
+    175.0,
+    ([0.0, 5.0, 25.0], [1.2, 0.8, 0.2]),
+    ([0.0, 5.0, 25.0], [1.5, 1.0, 0.3]),
+  )
 
   def __init__(self, CP):
     self.STEER_DELTA_UP = 3
@@ -66,6 +72,7 @@ class HyundaiSafetyFlags(IntFlag):
   CANFD_LKA_STEER_MSG_ALT = 128
   FCEV_GAS = 256
   ALT_LIMITS_2 = 512
+  CANFD_ANGLE_STEERING = 1024
 
 
 # Hyundai/Kia/Genesis SCC (Smart Cruise Control) and steering architecture:
@@ -182,6 +189,20 @@ class HyundaiCanFDBusRole(Enum):
 
 
 @dataclass(frozen=True)
+class HyundaiCanFDMessageRequirement:
+  role: HyundaiCanFDBusRole
+  address: int
+  dlc: int
+
+
+@dataclass(frozen=True)
+class HyundaiFirmwareRequirement:
+  ecu: CarParams.Ecu
+  address: int
+  version: bytes
+
+
+@dataclass(frozen=True)
 class HyundaiCanFDSteeringConfig:
   api: HyundaiCanFDSteeringApi = HyundaiCanFDSteeringApi.TORQUE_AUTO
   command_address: int | None = None
@@ -189,6 +210,8 @@ class HyundaiCanFDSteeringConfig:
   stock_bus: HyundaiCanFDBusRole | None = None
   command_bus: HyundaiCanFDBusRole | None = None
   measured_angle_signal: str | None = None
+  required_messages: tuple[HyundaiCanFDMessageRequirement, ...] = ()
+  required_firmware: tuple[HyundaiFirmwareRequirement, ...] = ()
 
 
 @dataclass
@@ -409,6 +432,21 @@ class CAR(Platforms):
       stock_bus=HyundaiCanFDBusRole.CAM,
       command_bus=HyundaiCanFDBusRole.ECAN,
       measured_angle_signal="MDPS_EstStrAnglVal",
+      required_messages=(
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0xCB, 24),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x1A0, 32),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x35, 32),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xA0, 24),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x125, 16),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x175, 24),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x1CF, 8),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xEA, 24),
+      ),
+      required_firmware=(
+        HyundaiFirmwareRequirement(Ecu.fwdRadar, 0x7D0, b'\xf1\x00MEev RDR -----      1.00 1.00 99110-GO000         '),
+        HyundaiFirmwareRequirement(Ecu.fwdCamera, 0x7C4, b'\xf1\x00ME  MFC  AT KOR LHD 1.00 1.01 99211-GO000 250103'),
+        HyundaiFirmwareRequirement(Ecu.adas, 0x730, b'\xf1\x00ME  FBL5 1.00 1.01 250122'),
+      ),
     ),
   )
   HYUNDAI_TUCSON_4TH_GEN = HyundaiCanFDPlatformConfig(
@@ -751,6 +789,9 @@ HYUNDAI_ECU_MANUFACTURING_DATE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER
 
 HYUNDAI_VERSION_RESPONSE = bytes([uds.SERVICE_TYPE.READ_DATA_BY_IDENTIFIER + 0x40])
 
+HYUNDAI_FW_QUERY_ECUS = [Ecu.eps, Ecu.abs, Ecu.fwdRadar, Ecu.fwdCamera, Ecu.parkingAdas,
+                         Ecu.transmission, Ecu.combinationMeter, Ecu.adas, Ecu.hvac, Ecu.cornerRadar]
+
 # Regex patterns for parsing platform code, FW date, and part number from FW versions
 PLATFORM_CODE_FW_PATTERN = re.compile(b'((?<=' + HYUNDAI_VERSION_REQUEST_LONG[1:] +
                                       b')[A-Z]{2}[A-Za-z0-9]{0,2})')
@@ -779,6 +820,7 @@ FW_QUERY_CONFIG = FwQueryConfig(
     Request(
       [HYUNDAI_VERSION_REQUEST_LONG],
       [HYUNDAI_VERSION_RESPONSE],
+      whitelist_ecus=HYUNDAI_FW_QUERY_ECUS,
     ),
 
     # CAN & CAN-FD queries (from camera)
@@ -791,6 +833,23 @@ FW_QUERY_CONFIG = FwQueryConfig(
       [HYUNDAI_VERSION_REQUEST_LONG],
       [HYUNDAI_VERSION_RESPONSE],
       bus=1,
+      obd_multiplexing=False,
+    ),
+    # Direct harness buses for single-panda CAN-FD installations. Limit these
+    # read-only DID queries to the ECUs used by the typed steering capability.
+    # No diagnostic-session change, communication-control, or write is sent.
+    Request(
+      [HYUNDAI_VERSION_REQUEST_LONG],
+      [HYUNDAI_VERSION_RESPONSE],
+      whitelist_ecus=[Ecu.fwdRadar],
+      bus=0,
+      obd_multiplexing=False,
+    ),
+    Request(
+      [HYUNDAI_VERSION_REQUEST_LONG],
+      [HYUNDAI_VERSION_RESPONSE],
+      whitelist_ecus=[Ecu.fwdCamera, Ecu.adas],
+      bus=2,
       obd_multiplexing=False,
     ),
 
@@ -826,7 +885,6 @@ FW_QUERY_CONFIG = FwQueryConfig(
               CAR.KIA_CEED, CAR.KIA_SELTOS],
   },
   extra_ecus=[
-    (Ecu.adas, 0x730, None),              # ADAS Driving ECU on platforms with LKA steering
     (Ecu.parkingAdas, 0x7b1, None),       # ADAS Parking ECU (may exist on all platforms)
     (Ecu.hvac, 0x7b3, None),              # HVAC Control Assembly
     (Ecu.cornerRadar, 0x7b7, None),

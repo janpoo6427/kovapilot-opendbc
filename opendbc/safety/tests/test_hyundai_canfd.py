@@ -6,6 +6,7 @@ from opendbc.car.hyundai.values import HyundaiSafetyFlags
 from opendbc.car.structs import CarParams
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.hyundai_common import HyundaiButtonBase, HyundaiLongitudinalBase
+from opendbc.safety.tests.libsafety import libsafety_py
 
 # All combinations of radar/camera-SCC and gas/hybrid/EV cars
 ALL_GAS_EV_HYBRID_COMBOS = [
@@ -230,6 +231,233 @@ class TestHyundaiCanfdLKASteeringLongEV(HyundaiLongitudinalBase, TestHyundaiCanf
     self.assertTrue(self._tx(self._accel_msg(0, accel_value=0)))
     self.assertFalse(self._tx(self._accel_msg(0, accel_value=5.0)))
     self.assertFalse(self._tx(self._accel_msg(5.0, accel_value=0)))
+
+
+class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafetyTest, common.CarSafetyTest):
+
+  DBC = "hyundai_canfd_generated"
+  SAFETY_MODEL = CarParams.SafetyModel.hyundaiCanfd
+  SAFETY_PARAM = HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_ANGLE_STEERING
+
+  TX_MSGS = [[0xCB, 0]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0xCB,)}
+  FWD_BLACKLISTED_ADDRS = {2: [0xCB]}
+
+  PT_BUS = 0
+  SCC_BUS = 2
+  BUTTONS_TX_BUS = 2
+  STANDSTILL_THRESHOLD = 12
+
+  STEER_ANGLE_MAX = 175.0
+  STEER_ANGLE_TEST_MAX = 55.0
+  DEG_TO_CAN = 10.0
+  ANGLE_RATE_BP = [0.0, 5.0, 25.0]
+  ANGLE_RATE_UP = [1.2, 0.8, 0.2]
+  ANGLE_RATE_DOWN = [1.5, 1.0, 0.3]
+  LATERAL_FREQUENCY = 100
+
+  def setUp(self):
+    self.angle_counter = 0
+    self.angle_frame = 0
+    super().setUp()
+    self.stock_lfa = {
+      "FCA_ESA_ActvSta": 0,
+      "BYTE7_RESERVED": 0,
+      "FCA_ESA_TqBstGainVal": 0,
+      **{f"BYTE{index}": 0 for index in range(9, 24)},
+    }
+    self._rx(self._stock_angle_msg())
+
+  def _angle_cmd_msg(self, angle, enabled, increment_timer=True, state=None, gain=None, counter=None, reserved=None):
+    if increment_timer:
+      self.safety.set_timer(self.angle_frame * int(1e6 / self.LATERAL_FREQUENCY))
+      self.angle_frame += 1
+    if counter is None:
+      self.angle_counter = (self.angle_counter + 1) & 0xFF
+      counter = self.angle_counter
+    values = self.stock_lfa | {
+      "COUNTER": counter,
+      "ADAS_ActvACISta": 0,
+      "ADAS_ActvACILvl2Sta": (2 if enabled else 1) if state is None else state,
+      "ADAS_StrAnglReqVal": angle,
+      "ADAS_ACIAnglTqRedcGainVal": (1.0 if enabled else 0.0) if gain is None else gain,
+    }
+    if reserved is not None:
+      values["BYTE7_RESERVED"] = reserved
+    return self.packer.make_can_msg_safety("LFA_ALT", 0, values)
+
+  def _angle_meas_msg(self, angle, **kwargs):
+    values = {"MDPS_EstStrAnglVal": angle, "MDPS_StrTqSnsrVal": 0}
+    values.update(kwargs)
+    return self.packer.make_can_msg_safety("MDPS", self.PT_BUS, values)
+
+  def _stock_angle_msg(self):
+    return self.packer.make_can_msg_safety("LFA_ALT", self.SCC_BUS, self.stock_lfa)
+
+  def _speed_msg(self, speed, wheels=("FL", "FR", "RL", "RR")):
+    values = {f"WHL_Spd{pos}Val": speed * 3.6 for pos in wheels}
+    return self.packer.make_can_msg_safety("WHEEL_SPEEDS", self.PT_BUS, values)
+
+  def _vehicle_moving_msg(self, speed):
+    values = {f"WHL_Spd{pos}Val": speed * 0.03125 for pos in ("FL", "FR", "RL", "RR")}
+    return self.packer.make_can_msg_safety("WHEEL_SPEEDS", self.PT_BUS, values)
+
+  def _user_brake_msg(self, brake):
+    return self.packer.make_can_msg_safety("TCS", self.PT_BUS,
+                                           {"DriverBraking": brake})
+
+  def _user_gas_msg(self, gas):
+    return self.packer.make_can_msg_safety("ACCELERATOR", self.PT_BUS,
+                                           {"ACCELERATOR_PEDAL": gas})
+
+  def _pcm_status_msg(self, enable):
+    return self.packer.make_can_msg_safety("SCC_CONTROL", self.SCC_BUS,
+                                           {"ACCMode": 1 if enable else 0})
+
+  def _button_msg(self, buttons, main_button=0, bus=None):
+    return self.packer.make_can_msg_safety("CRUISE_BUTTONS", self.PT_BUS, {
+      "CRUISE_BUTTONS": buttons,
+      "ADAPTIVE_CRUISE_MAIN_BTN": main_button,
+    })
+
+  def test_button_sends(self):
+    for controls_allowed in (False, True):
+      self.safety.set_controls_allowed(controls_allowed)
+      for button in range(8):
+        self.assertFalse(self._tx(self._button_msg(button)))
+
+  def test_angle_reserved_and_state_fields(self):
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, state=3)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, gain=0.996)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, reserved=1)))
+
+  def test_stock_fca_payload_must_be_preserved(self):
+    self.stock_lfa |= {"FCA_ESA_ActvSta": 1, "FCA_ESA_TqBstGainVal": 0.4, "BYTE9": 0x5A}
+    self.assertTrue(self._rx(self._stock_angle_msg()))
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+    self.stock_lfa["BYTE9"] = 0
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
+
+  def test_bad_angle_crc_rejected(self):
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+    msg = self._angle_cmd_msg(0, True)
+    dat = bytearray(msg.data)
+    dat[0] ^= 1
+    self.assertFalse(self._tx(libsafety_py.make_CANPacket(msg.addr, msg.bus, bytes(dat))))
+
+  def test_angle_counter_jump_rejected_then_resynchronized(self):
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True, counter=10)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, counter=12)))
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True, counter=13)))
+
+  def test_rejected_protocol_frame_does_not_advance_rate_state(self):
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertFalse(self._tx(self._angle_cmd_msg(1.2, True, reserved=1)))
+    self.safety.set_controls_allowed(True)
+    self.assertFalse(self._tx(self._angle_cmd_msg(2.4, True)))
+
+  def test_angle_measured_error(self):
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(10.0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(10.0, True)))
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(10.1)
+    self.assertFalse(self._tx(self._angle_cmd_msg(10.1, True)))
+
+  def test_driver_override_blocks_active_angle(self):
+    self._reset_angle_measurement(0)
+    self._rx(self._angle_meas_msg(0, MDPS_StrTqSnsrVal=251))
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, False)))
+
+  def test_active_angle_requires_measured_angle_inside_sixty_degrees(self):
+    for measured, desired in ((60.0, 59.0), (65.0, 60.0), (-60.0, -59.0), (-65.0, -60.0)):
+      self._reset_angle_measurement(measured)
+      self.safety.set_controls_allowed(True)
+      self._set_prev_desired_angle(desired)
+      self.assertFalse(self._tx(self._angle_cmd_msg(desired, True)))
+      self.assertTrue(self._tx(self._angle_cmd_msg(measured, False)))
+
+  def test_inactive_high_angle_clamps_to_command_limit(self):
+    for measured, commanded in ((300.0, self.STEER_ANGLE_MAX), (-300.0, -self.STEER_ANGLE_MAX)):
+      self._reset_angle_measurement(measured)
+      self.safety.set_controls_allowed(False)
+      self.assertTrue(self._tx(self._angle_cmd_msg(commanded, False)))
+
+  def test_angle_cmd_when_disabled(self):
+    # Inactive frames must track the measured angle exactly. Active frames are
+    # additionally constrained to a 10 degree envelope around the measurement.
+    for controls_allowed in (True, False):
+      for angle_meas in range(-90, 91, 10):
+        self._reset_angle_measurement(angle_meas)
+        for angle_cmd in range(-90, 91, 10):
+          self.safety.set_controls_allowed(controls_allowed)
+          self._set_prev_desired_angle(angle_cmd)
+          self.assertEqual(angle_cmd == angle_meas,
+                           self._tx(self._angle_cmd_msg(angle_cmd, False)))
+
+          self.safety.set_controls_allowed(controls_allowed)
+          self._set_prev_desired_angle(angle_cmd)
+          should_tx = controls_allowed and abs(angle_meas) < 60 and abs(angle_cmd) <= 60 and abs(angle_cmd - angle_meas) <= 10
+          self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(angle_cmd, True)))
+
+  def test_mdps_invalid_and_fault_clear_controls(self):
+    for values in ({"MDPS_EstStrAnglVal": 3276.6}, {"MDPS_LkaFailSta": 1},
+                   {"MDPS_ADAS_AciFltSig": 1}, {"MDPS_ADAS_AciFltSig_Lv2": 1}):
+      self._reset_safety_hooks()
+      self.safety.set_controls_allowed(True)
+      self._rx(self._angle_meas_msg(0, **values))
+      self.assertFalse(self.safety.get_controls_allowed())
+
+
+class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanfdAngleSteering):
+
+  SAFETY_PARAM = (HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CAMERA_SCC |
+                  HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.LONG)
+
+  TX_MSGS = [[0xCB, 0], [0x1A0, 0]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0xCB, 0x1A0)}
+  FWD_BLACKLISTED_ADDRS = {2: [0xCB, 0x1A0]}
+
+  DISABLED_ECU_UDS_MSG = (0x7D0, 0)
+  DISABLED_ECU_ACTUATION_MSG = (0x1A0, 0)
+
+  def _accel_msg(self, accel, aeb_req=False, aeb_decel=0, accel_value=None):
+    values = {
+      "aReqRaw": accel,
+      "aReqValue": accel if accel_value is None else accel_value,
+      "ACCMode": 1,
+      "MainMode_ACC": 1,
+    }
+    return self.packer.make_can_msg_safety("SCC_CONTROL", 0, values)
+
+  def test_accel_signals_checked_independently(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._accel_msg(0, accel_value=0)))
+    self.assertFalse(self._tx(self._accel_msg(0, accel_value=5.0)))
+    self.assertFalse(self._tx(self._accel_msg(5.0, accel_value=0)))
+
+  def test_tester_present_allowed(self, ecu_disable=True):
+    # This profile coexists with the stock ADAS/radar ECUs and must never send
+    # diagnostic keepalive or disable traffic.
+    super().test_tester_present_allowed(ecu_disable=False)
 
 
 # Tests longitudinal for ICE, hybrid, EV cars with LFA steering

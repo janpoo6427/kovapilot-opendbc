@@ -328,7 +328,10 @@ typedef struct {
   bool honda_fwd_brake;
 
   uint8_t hyundai_last_button_interaction;  // button messages since the user pressed an enable button
-
+  uint8_t hyundai_angle_stock_lfa[17];       // bytes 7..23 of stock camera LFA_ALT
+  bool hyundai_angle_stock_lfa_valid;
+  uint8_t hyundai_angle_tx_counter;
+  bool hyundai_angle_tx_counter_valid;
   bool tesla_stock_aeb;
   // Only rising edges while controls are not allowed are considered for these systems:
   // TODO: Only LKAS (non-emergency) is currently supported since we've only seen it
@@ -374,6 +377,7 @@ typedef struct {
   bool hyundai_legacy;
   bool hyundai_canfd_alt_buttons;
   bool hyundai_canfd_lka_steer_msg_alt;
+  bool hyundai_canfd_angle_steering;
 
   bool nissan_alt_eps;
 

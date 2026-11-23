@@ -1,10 +1,13 @@
 import unittest
+import copy
 
+from opendbc.can import CANPacker
 from opendbc.car import gen_empty_fingerprint
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.hyundaicanfd import CanBus
+from opendbc.car.hyundai.carcontroller import apply_hyundai_angle_limits
+from opendbc.car.hyundai.hyundaicanfd import CanBus, create_angle_steering, hkg_can_fd_checksum
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.hyundai.values import (CAR, DATE_FW_ECUS, CANFD_FUZZY_WHITELIST, PLATFORM_CODE_ECUS,
                                         HYUNDAI_VERSION_REQUEST_LONG, HyundaiCanFDSteeringApi, HyundaiFlags,
@@ -39,7 +42,7 @@ NO_DATES_PLATFORMS = {
   CAR.HYUNDAI_KONA_2022,
 }
 
-CANFD_EXPECTED_ECUS = {Ecu.fwdCamera, Ecu.fwdRadar}
+CANFD_EXPECTED_ECUS = {Ecu.fwdCamera, Ecu.fwdRadar, Ecu.adas}
 
 # CAN-only feature flags that should not appear on CAN FD platforms
 CAN_FEATURE_FLAGS = (HyundaiFlags.CLUSTER_GEARS | HyundaiFlags.TCU_GEARS | HyundaiFlags.CHECKSUM_CRC8 |
@@ -51,7 +54,81 @@ def cars_with(flags):
   return {c for c in CAR if c.config.flags & flags}
 
 
+class TestHyundaiCanFDAngleCommand(unittest.TestCase):
+  def setUp(self):
+    self.packer = CANPacker("hyundai_canfd_generated")
+    self.CAN = CanBus(None, gen_empty_fingerprint())
+
+  @staticmethod
+  def assert_valid_crc(msg):
+    address, dat, _ = msg
+    assert int.from_bytes(dat[:2], "little") == hkg_can_fd_checksum(address, None, bytearray(dat))
+
+  def test_active_command_matches_observed_lfa_alt_contract(self):
+    template = {
+      "ADAS_ActvACISta": 0xF,
+      "ADAS_ActvACILvl2Sta": 0xF,
+      "FCA_ESA_ActvSta": 0x3,
+      "BYTE7_RESERVED": 0x3F,
+      "FCA_ESA_TqBstGainVal": 1.0,
+      **{f"BYTE{index}": 0xFF for index in range(9, 24)},
+    }
+    msg = create_angle_steering(self.packer, self.CAN, 7, True, 12.3, template)
+    address, dat, bus = msg
+
+    self.assertEqual((address, bus, len(dat)), (0xCB, self.CAN.ECAN, 24))
+    self.assertEqual(dat[2], 7)
+    self.assertEqual(dat[3], 0x20)
+    self.assertEqual(int.from_bytes(dat[4:6], "little") & 0x3FFF, 123)
+    self.assertEqual(dat[6], 250)
+    self.assertEqual(dat[7], 0xFF)
+    self.assertEqual(dat[8], 250)
+    self.assertEqual(dat[9:], bytes([0xFF]) * 15)
+    self.assert_valid_crc(msg)
+
+  def test_inactive_command_uses_stock_inactive_state(self):
+    msg = create_angle_steering(self.packer, self.CAN, 0x105, False, -17.5, {})
+    _, dat, _ = msg
+
+    self.assertEqual(dat[2], 5)
+    self.assertEqual(dat[3], 0x10)
+    raw_angle = int.from_bytes(dat[4:6], "little") & 0x3FFF
+    self.assertEqual(raw_angle - (1 << 14), -175)
+    self.assertEqual(dat[6:], bytes(18))
+    self.assert_valid_crc(msg)
+
+  def test_controller_active_command_is_bounded_inside_safety_boundary(self):
+    apply_angle = 0.0
+    for _ in range(100):
+      apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, apply_angle, True, False)
+      self.assertTrue(active)
+      self.assertLessEqual(apply_angle, 59.9)
+
+    apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, 60.0, True, False)
+    self.assertFalse(active)
+    self.assertEqual(apply_angle, 60.0)
+
+    apply_angle, active = apply_hyundai_angle_limits(-120.0, apply_angle, 0.0, 0.0, True, True)
+    self.assertFalse(active)
+    self.assertEqual(apply_angle, 0.0)
+
+
 class TestHyundaiFingerprint(unittest.TestCase):
+  @staticmethod
+  def _ioniq9_fw():
+    return [
+      CarParams.CarFw(ecu=ecu, address=address, subAddress=0, fwVersion=versions[0])
+      for (ecu, address, _), versions in FW_VERSIONS[CAR.HYUNDAI_IONIQ_9].items()
+    ]
+
+  @staticmethod
+  def _ioniq9_fingerprint():
+    fingerprint = gen_empty_fingerprint()
+    CAN = CanBus(None, fingerprint)
+    for requirement in CAR.HYUNDAI_IONIQ_9.config.steering_config.required_messages:
+      fingerprint[getattr(CAN, requirement.role.value)][requirement.address] = requirement.dlc
+    return fingerprint
+
   def test_feature_detection(self):
     # LKA steering
     for lka_steering in (True, False):
@@ -70,33 +147,40 @@ class TestHyundaiFingerprint(unittest.TestCase):
       CP = CarInterface.get_params(CAR.HYUNDAI_SONATA, fingerprint, [], False, False, False)
       assert CP.radarUnavailable != radar
 
-  def test_angle_steering_capability_is_data_driven_and_passive(self):
-    fingerprint = gen_empty_fingerprint()
+  def test_angle_steering_capability_is_data_driven_and_lateral_only(self):
+    fingerprint = self._ioniq9_fingerprint()
     CAN = CanBus(None, fingerprint)
     steering_config = CAR.HYUNDAI_IONIQ_9.config.steering_config
     stock_bus = getattr(CAN, steering_config.stock_bus.value)
-    fingerprint[stock_bus][steering_config.command_address] = steering_config.command_dlc
+    car_fw = self._ioniq9_fw()
 
     # Fingerprinting supplies a string in production. Experimental longitudinal
-    # must not weaken the passive safety boundary.
-    CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, [], True, False, False)
+    # must not weaken the lateral-only safety boundary.
+    passive_CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, False, False, False)
+    assert passive_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+    assert passive_CP.dashcamOnly
+    assert passive_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+    CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, True, False, False)
     assert steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
     assert CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
     assert CP.steerControlType == CarParams.SteerControlType.angle
-    assert CP.dashcamOnly
-    assert CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+    assert not CP.dashcamOnly
+    assert CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.hyundaiCanfd
+    assert CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.CANFD_ANGLE_STEERING
+    assert not CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.LONG
     assert not CP.alphaLongitudinalAvailable
     assert not CP.openpilotLongitudinalControl
     assert CP.pcmCruise
 
     # Seeing LFA_ALT is not sufficient to select angle control for a torque profile.
-    torque_CP = CarInterface.get_params(CAR.KIA_EV6, fingerprint, [], False, False, False)
+    torque_CP = CarInterface.get_params(CAR.KIA_EV6, fingerprint, car_fw, False, False, False)
     assert not torque_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
     assert torque_CP.steerControlType == CarParams.SteerControlType.torque
 
     # The configured address must also have the observed DLC before the capability is exposed.
     fingerprint[stock_bus][steering_config.command_address] = 16
-    mismatched_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, [], False, False, False)
+    mismatched_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, False, False, False)
     assert not mismatched_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
     assert mismatched_CP.dashcamOnly
     assert mismatched_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
@@ -105,10 +189,52 @@ class TestHyundaiFingerprint(unittest.TestCase):
     fingerprint = gen_empty_fingerprint()
     wrong_bus = CAN.ECAN if stock_bus != CAN.ECAN else CAN.CAM
     fingerprint[wrong_bus][steering_config.command_address] = steering_config.command_dlc
-    wrong_bus_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, [], False, False, False)
+    wrong_bus_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, False, False, False)
     assert not wrong_bus_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
     assert wrong_bus_CP.dashcamOnly
     assert wrong_bus_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+    # A complete passive topology without all exact firmware cannot authorize output.
+    no_fw_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), [], False, False, False)
+    assert not no_fw_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+    assert no_fw_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+    wrong_fw = self._ioniq9_fw()
+    wrong_fw[0].fwVersion = b'\xf1\x00unexpected'
+    wrong_fw_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), wrong_fw, False, False, False)
+    assert not wrong_fw_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+    assert wrong_fw_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+    for requirement in steering_config.required_firmware:
+      wrong_fw = self._ioniq9_fw()
+      target = next(fw for fw in wrong_fw if fw.ecu.raw == requirement.ecu and fw.address == requirement.address)
+      target.fwVersion = b'\xf1\x00unexpected'
+      wrong_fw_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), wrong_fw, True, False, False)
+      assert not wrong_fw_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+      assert wrong_fw_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+    for requirement in steering_config.required_messages:
+      requirement_bus = getattr(CAN, requirement.role.value)
+
+      missing = copy.deepcopy(self._ioniq9_fingerprint())
+      del missing[requirement_bus][requirement.address]
+      missing_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, missing, car_fw, True, False, False)
+      assert not missing_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+      assert missing_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+      wrong_dlc = copy.deepcopy(self._ioniq9_fingerprint())
+      wrong_dlc[requirement_bus][requirement.address] = requirement.dlc - 1
+      wrong_dlc_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, wrong_dlc, car_fw, True, False, False)
+      assert not wrong_dlc_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+      assert wrong_dlc_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+      wrong_bus_fingerprint = copy.deepcopy(self._ioniq9_fingerprint())
+      del wrong_bus_fingerprint[requirement_bus][requirement.address]
+      other_bus = CAN.CAM if requirement_bus != CAN.CAM else CAN.ECAN
+      wrong_bus_fingerprint[other_bus][requirement.address] = requirement.dlc
+      wrong_bus_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, wrong_bus_fingerprint, car_fw, True, False, False)
+      assert not wrong_bus_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+      assert wrong_bus_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
 
     # Missing observations still enumerate the platform, but can never authorize output.
     empty_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, gen_empty_fingerprint(), [], False, False, False)
@@ -127,6 +253,8 @@ class TestHyundaiFingerprint(unittest.TestCase):
       assert steering_config.stock_bus is not None
       assert steering_config.command_bus is not None
       assert steering_config.measured_angle_signal is not None  # metadata-only until the parser path is implemented
+      assert steering_config.required_messages
+      assert steering_config.required_firmware
 
       CP = CarInterface.get_params(str(platform), gen_empty_fingerprint(), [], True, False, False)
       assert CP.dashcamOnly

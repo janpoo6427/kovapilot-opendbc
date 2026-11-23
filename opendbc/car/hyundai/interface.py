@@ -41,9 +41,16 @@ class CarInterface(CarInterfaceBase):
       steering_config = platform.config.steering_config
       angle_steering = steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
       if angle_steering:
-        stock_bus = getattr(CAN, steering_config.stock_bus.value)
-        observed_dlc = fingerprint[stock_bus].get(steering_config.command_address)
-        if observed_dlc == steering_config.command_dlc:
+        topology_matches = all(
+          fingerprint[getattr(CAN, requirement.role.value)].get(requirement.address) == requirement.dlc
+          for requirement in steering_config.required_messages
+        )
+        observed_firmware = {(fw.ecu.raw, fw.address, bytes(fw.fwVersion)) for fw in car_fw}
+        firmware_matches = all(
+          (requirement.ecu, requirement.address, requirement.version) in observed_firmware
+          for requirement in steering_config.required_firmware
+        )
+        if topology_matches and firmware_matches:
           ret.flags |= HyundaiFlags.CANFD_ANGLE_STEERING.value
 
       ret.alphaLongitudinalAvailable = not (ret.flags & HyundaiFlags.CANFD_NO_RADAR_DISABLE)
@@ -91,6 +98,8 @@ class CarInterface(CarInterfaceBase):
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_ALT_BUTTONS.value
       if ret.flags & HyundaiFlags.CANFD_CAMERA_SCC:
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CAMERA_SCC.value
+      if ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+        ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_ANGLE_STEERING.value
 
     else:
       # Shared configuration for non CAN-FD cars
@@ -166,14 +175,20 @@ class CarInterface(CarInterfaceBase):
 
     if ret.flags & HyundaiFlags.CANFD:
       steering_config = platform.config.steering_config
-      # Angle-command CAN-FD profiles remain identification-only until their
-      # controller path and panda safety model are implemented and validated.
+      # Angle-command CAN-FD profiles require the exact firmware and passive
+      # topology checks above. Longitudinal remains unavailable because it
+      # replaces stock SCC_CONTROL and its AEB/FCW behavior is not validated.
       if steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
-        ret.dashcamOnly = True
         ret.alphaLongitudinalAvailable = False
         ret.openpilotLongitudinalControl = False
         ret.pcmCruise = True
-        ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]
+        ret.safetyConfigs[-1].safetyParam &= ~HyundaiSafetyFlags.LONG.value
+        # Reuse the existing development-mode opt-in as a temporary staging
+        # gate. It authorizes lateral only; longitudinal stays disabled above.
+        lateral_staging_enabled = alpha_long and bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING)
+        if not lateral_staging_enabled:
+          ret.dashcamOnly = True
+          ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]
 
     return ret
 
