@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass, field
-from enum import IntFlag
+from enum import Enum, IntFlag
 
 from opendbc.car import Bus, CarSpecs, DbcDict, PlatformConfig, Platforms, uds
 from opendbc.car.common.conversions import Conversions as CV
@@ -149,6 +149,10 @@ class HyundaiFlags(IntFlag):
 
   HAS_BSM = 2 ** 27  # blind spot monitoring
 
+  # The platform uses the CAN-FD LFA_ALT angle steering API. This flag is set
+  # only after the platform capability and observed CAN topology agree.
+  CANFD_ANGLE_STEERING = 2 ** 28
+
 
 @dataclass
 class HyundaiCarDocs(CarDocs):
@@ -167,9 +171,30 @@ class HyundaiPlatformConfig(PlatformConfig):
       self.specs = self.specs.override(minSteerSpeed=32 * CV.MPH_TO_MS)
 
 
+class HyundaiCanFDSteeringApi(Enum):
+  TORQUE_AUTO = "torque_auto"
+  ANGLE_LFA_ALT = "angle_lfa_alt"
+
+
+class HyundaiCanFDBusRole(Enum):
+  CAM = "CAM"
+  ECAN = "ECAN"
+
+
+@dataclass(frozen=True)
+class HyundaiCanFDSteeringConfig:
+  api: HyundaiCanFDSteeringApi = HyundaiCanFDSteeringApi.TORQUE_AUTO
+  command_address: int | None = None
+  command_dlc: int | None = None
+  stock_bus: HyundaiCanFDBusRole | None = None
+  command_bus: HyundaiCanFDBusRole | None = None
+  measured_angle_signal: str | None = None
+
+
 @dataclass
 class HyundaiCanFDPlatformConfig(PlatformConfig):
   dbc_dict: DbcDict = field(default_factory=lambda: {Bus.pt: "hyundai_canfd_generated"})
+  steering_config: HyundaiCanFDSteeringConfig = field(default_factory=HyundaiCanFDSteeringConfig)
 
   def init(self):
     self.flags |= HyundaiFlags.CANFD
@@ -372,6 +397,19 @@ class CAR(Platforms):
     ],
     HYUNDAI_IONIQ_5.specs,
     flags=HyundaiFlags.EV | HyundaiFlags.CANFD_NO_RADAR_DISABLE,
+  )
+  HYUNDAI_IONIQ_9 = HyundaiCanFDPlatformConfig(
+    [HyundaiCarDocs("Hyundai Ioniq 9 2025", "All", car_parts=CarParts.common([CarHarness.hyundai_m]))],
+    CarSpecs(wheelbase=3.13, steerRatio=16.02),
+    flags=HyundaiFlags.EV,
+    steering_config=HyundaiCanFDSteeringConfig(
+      api=HyundaiCanFDSteeringApi.ANGLE_LFA_ALT,
+      command_address=0xCB,
+      command_dlc=24,
+      stock_bus=HyundaiCanFDBusRole.CAM,
+      command_bus=HyundaiCanFDBusRole.ECAN,
+      measured_angle_signal="MDPS_EstStrAnglVal",
+    ),
   )
   HYUNDAI_TUCSON_4TH_GEN = HyundaiCanFDPlatformConfig(
     [

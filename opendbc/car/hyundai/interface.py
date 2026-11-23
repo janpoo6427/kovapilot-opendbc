@@ -1,6 +1,6 @@
 from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
+from opendbc.car.hyundai.values import HyundaiCanFDSteeringApi, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
@@ -25,6 +25,7 @@ class CarInterface(CarInterfaceBase):
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
     ret.brand = "hyundai"
+    platform = CAR(candidate)
 
     if ret.flags & HyundaiFlags.CANFD:
       # Shared configuration for CAN-FD cars
@@ -36,6 +37,14 @@ class CarInterface(CarInterfaceBase):
       cam_can = CanBus(None, fingerprint).CAM
       lka_steering = 0x50 in fingerprint[cam_can] or 0x110 in fingerprint[cam_can]
       CAN = CanBus(None, fingerprint, lka_steering)
+
+      steering_config = platform.config.steering_config
+      angle_steering = steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
+      if angle_steering:
+        stock_bus = getattr(CAN, steering_config.stock_bus.value)
+        observed_dlc = fingerprint[stock_bus].get(steering_config.command_address)
+        if observed_dlc == steering_config.command_dlc:
+          ret.flags |= HyundaiFlags.CANFD_ANGLE_STEERING.value
 
       ret.alphaLongitudinalAvailable = not (ret.flags & HyundaiFlags.CANFD_NO_RADAR_DISABLE)
       if lka_steering and Ecu.adas not in [fw.ecu for fw in car_fw]:
@@ -115,7 +124,10 @@ class CarInterface(CarInterfaceBase):
     ret.centerToFront = ret.wheelbase * 0.4
     ret.steerActuatorDelay = 0.1
     ret.steerLimitTimer = 0.4
-    CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
+    if ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      ret.steerControlType = structs.CarParams.SteerControlType.angle
+    else:
+      CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
     if ret.flags & HyundaiFlags.ALT_LIMITS:
       ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.ALT_LIMITS.value
@@ -151,6 +163,17 @@ class CarInterface(CarInterfaceBase):
     # TODO: Optima Hybrid 2017 uses a different SCC12 checksum
     if candidate in (CAR.KIA_OPTIMA_H,):
       ret.dashcamOnly = True
+
+    if ret.flags & HyundaiFlags.CANFD:
+      steering_config = platform.config.steering_config
+      # Angle-command CAN-FD profiles remain identification-only until their
+      # controller path and panda safety model are implemented and validated.
+      if steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
+        ret.dashcamOnly = True
+        ret.alphaLongitudinalAvailable = False
+        ret.openpilotLongitudinalControl = False
+        ret.pcmCruise = True
+        ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]
 
     return ret
 
