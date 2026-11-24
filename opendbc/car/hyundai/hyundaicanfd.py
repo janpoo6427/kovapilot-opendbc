@@ -59,14 +59,14 @@ def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_torque)
   return ret
 
 
-def create_angle_steering(packer, CAN, frame, lat_active, apply_angle, lfa_alt):
+def create_angle_steering(packer, CAN, frame, lat_active, apply_angle, torque_reduction_gain, lfa_alt):
   values = dict(lfa_alt)
   values.update({
     "COUNTER": frame % 0x100,
     "ADAS_ActvACISta": 0,
     "ADAS_ActvACILvl2Sta": 2 if lat_active else 1,
     "ADAS_StrAnglReqVal": apply_angle,
-    "ADAS_ACIAnglTqRedcGainVal": 1.0 if lat_active else 0.0,
+    "ADAS_ACIAnglTqRedcGainVal": torque_reduction_gain if lat_active else 0.0,
   })
   # Preserve the stock camera's FCA emergency-steering payload verbatim.
   # Angle authority fields above and the checksum/counter are the only edits.

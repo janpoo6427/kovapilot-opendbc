@@ -208,7 +208,11 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
       stock_payload_matches = stock_payload_matches && (msg->data[i] == safety.hyundai_angle_stock_lfa[i - 7U]);
     }
 
-    const bool state_violation = steer_control_enabled ? (gain != 250U) : ((state != 1U) || (gain != 0U));
+    // Active commands may only reduce the MDPS torque ceiling from its stock
+    // maximum. Zero has no steering authority and is invalid while active;
+    // values above the physical 1.0/250 encoding remain blocked.
+    const bool state_violation = steer_control_enabled ? ((gain == 0U) || (gain > 250U)) :
+                                                         ((state != 1U) || (gain != 0U));
     const bool active_angle_violation = steer_control_enabled &&
                                         ((safety_abs_int(desired_angle) > 600) ||
                                          (safety.angle_meas.min <= -600) || (safety.angle_meas.max >= 600));

@@ -8,9 +8,11 @@ from opendbc.car import Bus, gen_empty_fingerprint
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.carcontroller import (ANGLE_DRIVER_TORQUE_RELEASE_FRAMES, ANGLE_ENGAGE_GRACE_FRAMES,
-                                                CarController, apply_hyundai_angle_limits, update_hyundai_angle_engage,
-                                                update_hyundai_angle_handover)
+from opendbc.car.hyundai.carcontroller import (ANGLE_DRIVER_TORQUE_LIMIT, ANGLE_DRIVER_TORQUE_RELEASE_FRAMES,
+                                                ANGLE_ENGAGE_GRACE_FRAMES, CarController, apply_hyundai_angle_limits,
+                                                get_hyundai_steering_output_can,
+                                                update_hyundai_angle_engage, update_hyundai_angle_handover,
+                                                update_hyundai_angle_torque_reduction_gain)
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import (CanBus, create_acc_control_from_stock, create_angle_camera_mdps,
                                               create_angle_steering, hkg_can_fd_checksum)
@@ -20,6 +22,7 @@ from opendbc.car.hyundai.values import (CAR, DATE_FW_ECUS, CANFD_FUZZY_WHITELIST
                                         HyundaiCanFDSteeringApi, HyundaiCanFDStockSafetyStatus, HyundaiFlags,
                                         DBC, get_platform_codes, HyundaiSafetyFlags, match_fw_to_car_fuzzy)
 from opendbc.car.hyundai.fingerprints import FW_VERSIONS
+from opendbc.car.vehicle_model import VehicleModel
 from opendbc.testing import fuzzy_test
 
 Ecu = CarParams.Ecu
@@ -80,21 +83,21 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
       "FCA_ESA_TqBstGainVal": 1.0,
       **{f"BYTE{index}": 0xFF for index in range(9, 24)},
     }
-    msg = create_angle_steering(self.packer, self.CAN, 7, True, 12.3, template)
+    msg = create_angle_steering(self.packer, self.CAN, 7, True, 12.3, 0.6, template)
     address, dat, bus = msg
 
     self.assertEqual((address, bus, len(dat)), (0xCB, self.CAN.ECAN, 24))
     self.assertEqual(dat[2], 7)
     self.assertEqual(dat[3], 0x20)
     self.assertEqual(int.from_bytes(dat[4:6], "little") & 0x3FFF, 123)
-    self.assertEqual(dat[6], 250)
+    self.assertEqual(dat[6], 150)
     self.assertEqual(dat[7], 0xFF)
     self.assertEqual(dat[8], 250)
     self.assertEqual(dat[9:], bytes([0xFF]) * 15)
     self.assert_valid_crc(msg)
 
   def test_inactive_command_uses_stock_inactive_state(self):
-    msg = create_angle_steering(self.packer, self.CAN, 0x105, False, -17.5, {})
+    msg = create_angle_steering(self.packer, self.CAN, 0x105, False, -17.5, 0.8, {})
     _, dat, _ = msg
 
     self.assertEqual(dat[2], 5)
@@ -124,8 +127,27 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
     self.assertTrue(active)
     self.assertEqual(apply_angle, 28.0)
 
+  def test_vehicle_model_limits_high_speed_angle_and_tracks_measurement_when_inactive(self):
+    CP = CarParams.new_message()
+    CP.wheelbase = 3.13
+    CP.centerToFront = 1.35
+    CP.rotationalInertiaPerMass = 2.0
+    CP.tireStiffnessFrontPerMass = 45.0
+    CP.tireStiffnessRearPerMass = 55.0
+    CP.steerRatio = 15.5
+    VM = VehicleModel(CP)
+
+    static_angle, active = apply_hyundai_angle_limits(50.0, 40.0, 35.0, 40.0, True, True)
+    model_angle, model_active = apply_hyundai_angle_limits(50.0, 40.0, 35.0, 40.0, True, True, VM)
+    self.assertTrue(active and model_active)
+    self.assertLess(model_angle, static_angle)
+
+    inactive_angle, inactive = apply_hyundai_angle_limits(-50.0, model_angle, 35.0, 17.0, True, False, VM)
+    self.assertFalse(inactive)
+    self.assertEqual(inactive_angle, 17.0)
+
   def test_driver_override_handover_requires_quiet_release_window(self):
-    allowed, latched, frames = update_hyundai_angle_handover(True, False, 251.0, False, 0)
+    allowed, latched, frames = update_hyundai_angle_handover(True, False, ANGLE_DRIVER_TORQUE_LIMIT + 1, False, 0)
     self.assertFalse(allowed)
     self.assertTrue(latched)
     for _ in range(ANGLE_DRIVER_TORQUE_RELEASE_FRAMES - 1):
@@ -135,6 +157,24 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
     self.assertTrue(allowed)
     self.assertFalse(latched)
     self.assertEqual(frames, 0)
+
+  def test_angle_torque_reduction_gain_yields_faster_than_recovery(self):
+    gain = 0.0
+    gain = update_hyundai_angle_torque_reduction_gain(0.0, 12.0, True, gain)
+    self.assertEqual(gain, 0.004)
+    for _ in range(249):
+      gain = update_hyundai_angle_torque_reduction_gain(0.0, 12.0, True, gain)
+    self.assertLessEqual(gain, 0.85)
+
+    reduced = update_hyundai_angle_torque_reduction_gain(700.0, 12.0, True, gain)
+    self.assertLess(reduced, gain)
+    self.assertGreaterEqual(gain - reduced, 0.012)
+    self.assertEqual(update_hyundai_angle_torque_reduction_gain(0.0, 12.0, False, 0.004), 0.0)
+
+  def test_angle_torque_output_reports_transmitted_authority(self):
+    self.assertEqual(get_hyundai_steering_output_can(True, True, 0.6, 123), 150)
+    self.assertEqual(get_hyundai_steering_output_can(True, False, 0.6, 123), 0)
+    self.assertEqual(get_hyundai_steering_output_can(False, False, 0.6, 123), 123)
 
   def test_angle_engage_waits_for_stable_authority(self):
     frames = 0

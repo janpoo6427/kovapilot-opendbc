@@ -1,12 +1,15 @@
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL, make_tester_present_msg, structs
-from opendbc.car.lateral import apply_driver_steer_torque_limits, apply_std_steer_angle_limits, common_fault_avoidance
+from opendbc.car.common.filter_simple import FirstOrderFilter
+from opendbc.car.lateral import (AngleSteeringLimitsVM, apply_driver_steer_torque_limits, apply_std_steer_angle_limits,
+                                 apply_steer_angle_limits_vm, common_fault_avoidance)
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR
 from opendbc.car.interfaces import CarControllerBase
+from opendbc.car.vehicle_model import VehicleModel
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -25,10 +28,17 @@ CANCEL_BUTTON_DELAY_FRAMES = 10
 ANGLE_ACTIVE_MEASURED_MAX = 60.0
 ANGLE_ACTIVE_COMMAND_MAX = 59.9
 ANGLE_MAX_MEASURED_ERROR = 8.0
-ANGLE_DRIVER_TORQUE_LIMIT = 250.0
-ANGLE_DRIVER_TORQUE_RELEASE = 200.0
+ANGLE_DRIVER_TORQUE_LIMIT = 225.0
+ANGLE_DRIVER_TORQUE_RELEASE = 175.0
 ANGLE_DRIVER_TORQUE_RELEASE_FRAMES = 10
 ANGLE_ENGAGE_GRACE_FRAMES = 50
+ANGLE_FILTER_RC_BP = (5.0, 10.0, 20.0)
+ANGLE_FILTER_RC_V = (0.2, 0.1, 0.0)
+
+
+class HyundaiCanFDAngleParams:
+  STEER_STEP = 1
+  ANGLE_LIMITS = AngleSteeringLimitsVM(ANGLE_ACTIVE_COMMAND_MAX, MAX_ANGLE_RATE=1.2)
 
 
 def update_hyundai_angle_engage(lateral_authorized, engage_frames):
@@ -53,10 +63,40 @@ def update_hyundai_angle_handover(lat_active, steering_pressed, steering_torque,
   return True, override_latched, release_frames
 
 
-def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle, lat_active, authority_allowed):
+def update_hyundai_angle_torque_reduction_gain(steering_torque, v_ego, authority_requested, gain_last):
+  if authority_requested:
+    ceiling = float(np.interp(v_ego, [0.5, 1.5], [1.0, 0.85]))
+    shelf = float(np.interp(v_ego, [2.0, 11.0], [0.45, 0.6]))
+    floor = float(np.interp(v_ego, [2.0, 22.0], [0.1, 0.3]))
+    torque_points = (
+      float(np.interp(v_ego, [2.0, 11.0], [75.0, 125.0])),
+      float(np.interp(v_ego, [2.0, 11.0], [125.0, 150.0])),
+      float(np.interp(v_ego, [2.0, 11.0], [175.0, 275.0])),
+      float(np.interp(v_ego, [2.0, 22.0], [400.0, 700.0])),
+    )
+    target = float(np.interp(abs(steering_torque), torque_points, [ceiling, shelf, shelf, floor]))
+  else:
+    target = 0.0
+
+  # Yield authority faster than it is restored. Quantize to the 0.004 CAN
+  # signal step so the controller and panda evaluate the exact same value.
+  gain = float(np.clip(target, gain_last - 0.014, gain_last + 0.004))
+  return float(np.clip(round(gain / 0.004) * 0.004, 0.0, 1.0))
+
+
+def get_hyundai_steering_output_can(angle_steering, angle_active, angle_torque_reduction_gain, apply_torque):
+  if angle_steering:
+    return int(round(angle_torque_reduction_gain * 250.0)) if angle_active else 0
+  return apply_torque
+
+
+def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle, lat_active, authority_allowed, VM=None):
   angle_active = lat_active and authority_allowed and abs(measured_angle) < ANGLE_ACTIVE_MEASURED_MAX
   if angle_active:
     requested_angle = float(np.clip(requested_angle, -ANGLE_ACTIVE_COMMAND_MAX, ANGLE_ACTIVE_COMMAND_MAX))
+  if VM is not None:
+    requested_angle = apply_steer_angle_limits_vm(requested_angle, apply_angle_last, v_ego, measured_angle,
+                                                  angle_active, HyundaiCanFDAngleParams, VM)
   apply_angle = apply_std_steer_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle,
                                              angle_active, CarControllerParams.ANGLE_LIMITS)
   if angle_active:
@@ -101,6 +141,9 @@ class CarController(CarControllerBase):
     self.scc_counter = None
     self.apply_torque_last = 0
     self.apply_angle_last = 0.0
+    self.angle_filter = FirstOrderFilter(0.0, ANGLE_FILTER_RC_V[1], DT_CTRL)
+    self.angle_vm = VehicleModel(CP)
+    self.angle_torque_reduction_gain = 0.0
     self.angle_active = False
     self.angle_override_latched = False
     self.angle_override_release_frames = 0
@@ -112,6 +155,7 @@ class CarController(CarControllerBase):
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
     hud_control = CC.hudControl
+    angle_steering = bool(self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING)
 
     # steering torque
     new_torque = int(round(actuators.torque * self.params.STEER_MAX))
@@ -128,16 +172,26 @@ class CarController(CarControllerBase):
     self.apply_torque_last = apply_torque
 
     apply_angle = actuators.steeringAngleDeg
-    if self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+    if angle_steering:
       lateral_authorized = CC.latActive and (self.CP.openpilotLongitudinalControl or CS.out.cruiseState.enabled)
       angle_engage_ready, self.angle_engage_frames = update_hyundai_angle_engage(lateral_authorized, self.angle_engage_frames)
       authority_allowed, self.angle_override_latched, self.angle_override_release_frames = update_hyundai_angle_handover(
         angle_engage_ready, CS.out.steeringPressed, CS.out.steeringTorque,
         self.angle_override_latched, self.angle_override_release_frames,
       )
+      authority_requested = lateral_authorized and not self.angle_override_latched and not CS.out.steeringPressed
+      self.angle_torque_reduction_gain = update_hyundai_angle_torque_reduction_gain(
+        CS.out.steeringTorque, CS.out.vEgoRaw, authority_requested, self.angle_torque_reduction_gain,
+      )
+      if authority_allowed:
+        self.angle_filter.update_alpha(float(np.interp(CS.out.vEgo, ANGLE_FILTER_RC_BP, ANGLE_FILTER_RC_V)))
+        requested_angle = self.angle_filter.update(actuators.steeringAngleDeg)
+      else:
+        self.angle_filter.x = CS.out.steeringAngleDeg
+        requested_angle = CS.out.steeringAngleDeg
       apply_angle, self.angle_active = apply_hyundai_angle_limits(
-        actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
-        CS.out.steeringAngleDeg, angle_engage_ready, authority_allowed,
+        requested_angle, self.apply_angle_last, CS.out.vEgoRaw,
+        CS.out.steeringAngleDeg, angle_engage_ready, authority_allowed, self.angle_vm,
       )
       self.apply_angle_last = apply_angle
 
@@ -180,7 +234,9 @@ class CarController(CarControllerBase):
 
     new_actuators = actuators.as_builder()
     new_actuators.torque = apply_torque / self.params.STEER_MAX
-    new_actuators.torqueOutputCan = apply_torque
+    new_actuators.torqueOutputCan = get_hyundai_steering_output_can(
+      angle_steering, self.angle_active, self.angle_torque_reduction_gain, apply_torque,
+    )
     new_actuators.steeringAngleDeg = apply_angle
     new_actuators.accel = accel
 
@@ -243,7 +299,7 @@ class CarController(CarControllerBase):
     # steering control
     if angle_steering:
       can_sends.append(hyundaicanfd.create_angle_steering(self.packer, self.CAN, self.frame, self.angle_active,
-                                                          self.apply_angle_last, CS.lfa_alt))
+                                                          self.apply_angle_last, self.angle_torque_reduction_gain, CS.lfa_alt))
       can_sends.append(hyundaicanfd.create_angle_camera_mdps(self.packer, self.CAN, CS.mdps, self.angle_active))
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_torque))

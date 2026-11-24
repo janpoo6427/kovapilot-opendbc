@@ -354,8 +354,11 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
     self.safety.set_controls_allowed(True)
     self._set_prev_desired_angle(0)
     self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True, gain=0.996)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True, gain=0.004)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, gain=0.0)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, gain=1.004)))
     self.assertFalse(self._tx(self._angle_cmd_msg(0, True, state=3)))
-    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, gain=0.996)))
     self.assertFalse(self._tx(self._angle_cmd_msg(0, True, reserved=1)))
 
   def test_stock_fca_payload_must_be_preserved(self):
