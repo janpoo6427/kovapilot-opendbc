@@ -4,11 +4,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from opendbc.can import CANPacker
-from opendbc.car import gen_empty_fingerprint
+from opendbc.car import Bus, gen_empty_fingerprint
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.carcontroller import CarController, apply_hyundai_angle_limits
+from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import (CanBus, create_acc_control_from_stock, create_angle_steering,
                                               hkg_can_fd_checksum)
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
@@ -384,6 +385,15 @@ class TestHyundaiFingerprint(unittest.TestCase):
     self.assertEqual([(address, bus, len(dat)) for address, dat, bus in frame_two],
                      [(0xCB, controller.CAN.ECAN, 24), (0x1A0, controller.CAN.ECAN, 32)])
     self.assertEqual(frame_two[1][1][2], 0x22)
+
+  def test_ioniq9_bursty_bsm_does_not_gate_can_validity(self):
+    fingerprint = self._ioniq9_fingerprint()
+    CAN = CanBus(None, fingerprint)
+    fingerprint[CAN.ECAN][0x1BA] = 32
+    CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, self._ioniq9_fw(), True, False, False)
+
+    pt_parser = CarState(CP).get_can_parsers(CP)[Bus.pt]
+    assert pt_parser.message_states[0x1BA].ignore_alive
 
   def test_angle_steering_config_is_complete_and_passive(self):
     for platform in CAR:

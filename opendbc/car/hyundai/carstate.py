@@ -314,6 +314,10 @@ class CarState(CarStateBase):
         # this message is 50Hz but the ECU frequently stops transmitting for ~0.5s
         ("CRUISE_BUTTONS", 1)
       ]
+    if CP.flags & HyundaiFlags.HAS_BSM:
+      # This frame is bursty on the observed HDA2 topology. Decode blind-spot
+      # state without making the entire powertrain parser invalid while quiet.
+      msgs.append(("ADAS_CMD_50_50ms", math.nan))
     cam_msgs = []
     if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
       cam_msgs.append(("LFA_ALT", 100))
