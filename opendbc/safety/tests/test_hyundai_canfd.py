@@ -2,9 +2,14 @@
 from opendbc.testing import parameterized_class
 import unittest
 
-from opendbc.car.hyundai.values import HyundaiSafetyFlags
+from opendbc.car.hyundai.interface import CarInterface
+from opendbc.car.hyundai.values import (CAR, CarControllerParams, HyundaiAngleSafetyProfile, HyundaiSafetyFlags,
+                                        encode_angle_safety_profile)
+from opendbc.car.lateral import get_max_angle_delta_vm, get_max_angle_vm
 from opendbc.car.structs import CarParams
+from opendbc.car.vehicle_model import VehicleModel
 import opendbc.safety.tests.common as common
+from opendbc.safety.tests.common import away_round
 from opendbc.safety.tests.hyundai_common import HyundaiButtonBase, HyundaiLongitudinalBase
 
 # All combinations of radar/camera-SCC and gas/hybrid/EV cars
@@ -102,6 +107,157 @@ class TestHyundaiCanfdBase(HyundaiButtonBase, common.CarSafetyTest, common.Drive
     # driver override is engaged
     self._rx(self.packer.make_can_msg_safety("SCC_CONTROL", self.SCC_BUS, {"ACCMode": 2}))
     self.assertTrue(self.safety.get_cruise_engaged_prev())
+
+
+class TestHyundaiCanfdLFAAltAngle(HyundaiButtonBase, common.CarSafetyTest, common.AngleSteeringSafetyTest):
+
+  DBC = "hyundai_canfd_generated"
+  SAFETY_MODEL = CarParams.SafetyModel.hyundaiCanfd
+  SAFETY_PARAM = (HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CANFD_ANGLE_STEERING |
+                  encode_angle_safety_profile(HyundaiAngleSafetyProfile.IONIQ_9))
+
+  TX_MSGS = [[0xCB, 0], [0x1CF, 2], [0x1A0, 0]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0xCB,)}
+  FWD_BLACKLISTED_ADDRS = {2: [0xCB]}
+
+  PT_BUS = 0
+  SCC_BUS = 2
+  BUTTONS_TX_BUS = 2
+  GAS_MSG = ("ACCELERATOR", "ACCELERATOR_PEDAL")
+  STEER_ANGLE_MAX = 175
+  DEG_TO_CAN = 10
+  LATERAL_FREQUENCY = 100
+  cnt_angle_cmd = 0
+
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    cls.CP = CarInterface.get_non_essential_params(CAR.HYUNDAI_IONIQ_9)
+    cls.VM = VehicleModel(cls.CP)
+
+  def _angle_cmd_msg(self, angle: float, enabled: bool, increment_timer: bool = True, gain: float = 0.0):
+    if increment_timer:
+      self.safety.set_timer(self.__class__.cnt_angle_cmd * int(1e6 / self.LATERAL_FREQUENCY))
+      self.__class__.cnt_angle_cmd += 1
+    values = {
+      "ADAS_ActvACISta": 0,
+      "ADAS_ActvACILvl2Sta": 2 if enabled else 1,
+      "ADAS_StrAnglReqVal": angle,
+      "ADAS_ACIAnglTqRedcGainVal": gain,
+      "FCA_ESA_ActvSta": 0,
+      "FCA_ESA_TqBstGainVal": 0,
+    }
+    return self.packer.make_can_msg_safety("LFA_ALT", self.PT_BUS, values)
+
+  def _angle_meas_msg(self, angle: float):
+    return self.packer.make_can_msg_safety("MDPS", self.PT_BUS, {"MDPS_EstStrAnglVal": angle, "MDPS_StrTqSnsrVal": 0})
+
+  def _torque_driver_msg(self, torque):
+    return self.packer.make_can_msg_safety("MDPS", self.PT_BUS, {"MDPS_EstStrAnglVal": 0, "MDPS_StrTqSnsrVal": torque})
+
+  def _speed_msg(self, speed, wheels=("FL", "FR", "RL", "RR")):
+    values = {f"WHL_Spd{pos}Val": speed * 3.6 for pos in wheels}
+    return self.packer.make_can_msg_safety("WHEEL_SPEEDS", self.PT_BUS, values)
+
+  def _user_brake_msg(self, brake):
+    return self.packer.make_can_msg_safety("TCS", self.PT_BUS, {"DriverBraking": brake})
+
+  def _user_gas_msg(self, gas):
+    return self.packer.make_can_msg_safety(self.GAS_MSG[0], self.PT_BUS, {self.GAS_MSG[1]: gas})
+
+  def _pcm_status_msg(self, enable):
+    return self.packer.make_can_msg_safety("SCC_CONTROL", self.SCC_BUS, {"ACCMode": 1 if enable else 0})
+
+  def _button_msg(self, buttons, main_button=0, bus=None):
+    bus = self.PT_BUS if bus is None else bus
+    return self.packer.make_can_msg_safety("CRUISE_BUTTONS", bus, {
+      "CRUISE_BUTTONS": buttons,
+      "ADAPTIVE_CRUISE_MAIN_BTN": main_button,
+    })
+
+  def _get_steer_cmd_angle_max(self, speed):
+    return get_max_angle_vm(max(speed, 1), self.VM, CarControllerParams(self.CP))
+
+  def test_angle_cmd_when_enabled(self):
+    # Vehicle-model acceleration and jerk boundaries are checked explicitly below.
+    pass
+
+  def test_angle_cmd_when_disabled(self):
+    for controls_allowed in (True, False):
+      for enabled in (True, False):
+        for measured in (-30, 0, 30):
+          self.safety.set_controls_allowed(controls_allowed)
+          self._reset_angle_measurement(measured)
+          for commanded in (measured - 20.1, measured - 20, measured, measured + 20, measured + 20.1):
+            self.safety.set_desired_angle_last(round(commanded * self.DEG_TO_CAN))
+            if enabled:
+              should_tx = controls_allowed and abs(commanded - measured) <= 20
+            else:
+              should_tx = commanded == measured
+            self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(commanded, enabled)))
+
+  def test_vehicle_model_angle_limits(self):
+    limits = CarControllerParams(self.CP)
+    speed = 20.0
+    self._reset_speed_measurement(speed + 1.0)
+    self._reset_angle_measurement(0)
+    self.safety.set_controls_allowed(True)
+
+    max_angle = get_max_angle_vm(speed, self.VM, limits)
+    max_angle_can = min(int(max_angle * self.DEG_TO_CAN + 1), self.STEER_ANGLE_MAX * self.DEG_TO_CAN)
+    self._reset_angle_measurement(max_angle_can / self.DEG_TO_CAN)
+    self.safety.set_desired_angle_last(max_angle_can)
+    self.assertTrue(self._tx(self._angle_cmd_msg(max_angle_can / self.DEG_TO_CAN, True)))
+    self.assertFalse(self._tx(self._angle_cmd_msg((max_angle_can + 2) / self.DEG_TO_CAN, True)))
+
+    self._reset_angle_measurement(0)
+    self.safety.set_desired_angle_last(0)
+    max_delta = get_max_angle_delta_vm(speed, self.VM, limits)
+    max_delta_can = away_round(max_delta * self.DEG_TO_CAN)
+    self.assertTrue(self._tx(self._angle_cmd_msg(max_delta_can / self.DEG_TO_CAN, True)))
+    self.safety.set_desired_angle_last(0)
+    self.assertFalse(self._tx(self._angle_cmd_msg((max_delta_can + 2) / self.DEG_TO_CAN, True)))
+
+  def test_torque_reduction_gain(self):
+    self.safety.set_controls_allowed(True)
+    for gain in (0.0, 0.1, 0.5, 1.0):
+      self.assertTrue(self._tx(self._angle_cmd_msg(0, True, gain=gain)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, False, gain=0.1)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, False, gain=0.0)))
+
+  def test_driver_override_blocks_angle_request(self):
+    self.safety.set_controls_allowed(True)
+    for _ in range(common.MAX_SAMPLE_VALS):
+      self._rx(self._torque_driver_msg(251))
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True, gain=0.1)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, False, gain=0.0)))
+
+  def test_measured_angle_error_blocks_angle_request(self):
+    self.safety.set_controls_allowed(True)
+    self._reset_angle_measurement(0)
+    self.safety.set_desired_angle_last(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(20, True)))
+    self.safety.set_desired_angle_last(201)
+    self.assertFalse(self._tx(self._angle_cmd_msg(20.1, True)))
+
+  def test_angle_profile_and_topology_flags_are_required(self):
+    msg = self._angle_cmd_msg(0, False)
+    for param in (
+      self.SAFETY_PARAM & ~HyundaiSafetyFlags.CAMERA_SCC,
+      self.SAFETY_PARAM & ~HyundaiSafetyFlags.CANFD_ANGLE_STEERING,
+      self.SAFETY_PARAM & ~(31 << 11),
+      self.SAFETY_PARAM | HyundaiSafetyFlags.CANFD_LKA_STEER_MSG,
+      self.SAFETY_PARAM | HyundaiSafetyFlags.LONG,
+    ):
+      self.safety.set_safety_hooks(self.SAFETY_MODEL, param)
+      self.safety.init_tests()
+      self.assertFalse(self._tx(msg), param)
+
+  def test_unused_aci_fields_are_blocked(self):
+    self.safety.set_controls_allowed(True)
+    for signal in ("ADAS_ActvACISta", "FCA_ESA_ActvSta", "FCA_ESA_TqBstGainVal"):
+      values = {"ADAS_ActvACILvl2Sta": 2, signal: 1}
+      self.assertFalse(self._tx(self.packer.make_can_msg_safety("LFA_ALT", self.PT_BUS, values)), signal)
 
 
 class TestHyundaiCanfdLFASteeringBase(TestHyundaiCanfdBase):

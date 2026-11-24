@@ -7,6 +7,7 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.structs import CarParams
 from opendbc.car.docs_definitions import CarHarness, CarDocs, CarParts
 from opendbc.car.fw_query_definitions import FwQueryConfig, Request, p16
+from opendbc.car.lateral import AngleSteeringLimitsVM
 
 Ecu = CarParams.Ecu
 
@@ -23,6 +24,7 @@ class CarControllerParams:
     self.STEER_DRIVER_FACTOR = 1
     self.STEER_THRESHOLD = 150
     self.STEER_STEP = 1  # 100 Hz
+    self.ANGLE_LIMITS = AngleSteeringLimitsVM(175, MAX_ANGLE_RATE=1.0)
 
     if CP.flags & HyundaiFlags.CANFD:
       self.STEER_MAX = 270
@@ -66,6 +68,19 @@ class HyundaiSafetyFlags(IntFlag):
   CANFD_LKA_STEER_MSG_ALT = 128
   FCEV_GAS = 256
   ALT_LIMITS_2 = 512
+  CANFD_ANGLE_STEERING = 1024
+
+
+class HyundaiAngleSafetyProfile(IntFlag):
+  NONE = 0
+  IONIQ_9 = 1
+
+
+HYUNDAI_ANGLE_SAFETY_PROFILE_SHIFT = 11
+
+
+def encode_angle_safety_profile(profile: HyundaiAngleSafetyProfile) -> int:
+  return int(profile) << HYUNDAI_ANGLE_SAFETY_PROFILE_SHIFT
 
 
 # Hyundai/Kia/Genesis SCC (Smart Cruise Control) and steering architecture:
@@ -189,6 +204,12 @@ class HyundaiCanFDSteeringConfig:
   stock_bus: HyundaiCanFDBusRole | None = None
   command_bus: HyundaiCanFDBusRole | None = None
   measured_angle_signal: str | None = None
+  safety_profile: HyundaiAngleSafetyProfile = HyundaiAngleSafetyProfile.NONE
+  control_enabled: bool = False
+  active_value: int = 2
+  inactive_value: int = 1
+  max_torque_reduction_gain: int = 250
+  max_measured_angle_error: float = 20.0
 
 
 @dataclass
@@ -409,6 +430,8 @@ class CAR(Platforms):
       stock_bus=HyundaiCanFDBusRole.CAM,
       command_bus=HyundaiCanFDBusRole.ECAN,
       measured_angle_signal="MDPS_EstStrAnglVal",
+      safety_profile=HyundaiAngleSafetyProfile.IONIQ_9,
+      control_enabled=True,
     ),
   )
   HYUNDAI_TUCSON_4TH_GEN = HyundaiCanFDPlatformConfig(

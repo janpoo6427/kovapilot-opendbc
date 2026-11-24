@@ -24,6 +24,11 @@
 #define HYUNDAI_CANFD_SCC_CONTROL_COMMON_TX_MSGS(e_can, longitudinal) \
   {0x1A0, (e_can), 32, .check_relay = (longitudinal)},  /* SCC_CONTROL */ \
 
+#define HYUNDAI_CANFD_ANGLE_STEERING_TX_MSGS \
+  {0xCB,  0, 24, .check_relay = true},   /* LFA_ALT */       \
+  {0x1CF, 2,  8, .check_relay = false},  /* CRUISE_BUTTON */ \
+  {0x1A0, 0, 32, .check_relay = false},  /* SCC cancel */    \
+
 // *** Addresses checked in rx hook ***
 // EV, ICE, HYBRID: ACCELERATOR (0x35), ACCELERATOR_BRAKE_ALT (0x100), ACCELERATOR_ALT (0x105)
 #define HYUNDAI_CANFD_COMMON_RX_CHECKS(pt_bus)                                                                          \
@@ -73,6 +78,15 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   if (msg_matches(msg, 0xeaU, pt_bus)) {
     int torque_driver_new = from_offset(GET_BYTES_LE(msg, 10, 2) & 0x1FFFU, 4095);
     update_sample(&safety.torque_driver, torque_driver_new);
+
+    if (safety_setup.hyundai_canfd_angle_steering) {
+      const uint16_t angle_raw = GET_BYTES_LE(msg, 16, 2);
+      if ((angle_raw == 0x7FFEU) || (angle_raw == 0x7FFFU)) {
+        safety.controls_allowed = false;
+      } else {
+        update_sample(&safety.angle_meas, to_signed(angle_raw, 16));
+      }
+    }
   }
 
   // cruise buttons
@@ -114,6 +128,8 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     uint32_t rr = (GET_BYTES_LE(msg, 14, 2)) & 0x3FFFU;
     safety.vehicle_moving = (fl > HYUNDAI_STANDSTILL_THRSLD) || (fr > HYUNDAI_STANDSTILL_THRSLD) ||
                      (rl > HYUNDAI_STANDSTILL_THRSLD) || (rr > HYUNDAI_STANDSTILL_THRSLD);
+    const float speed_kph = ((float)(fl + fr + rl + rr) / 4.0f) * 0.03125f;
+    UPDATE_VEHICLE_SPEED(speed_kph * KPH_TO_MS);
   }
 
   // cruise state
@@ -143,16 +159,52 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
     .has_steer_req_tolerance = true,
   };
 
+  const AngleSteeringLimits HYUNDAI_CANFD_ANGLE_STEERING_LIMITS = {
+    .max_angle = 1750,
+    .angle_deg_to_can = 10.0f,
+    .frequency = 100U,
+  };
+
+  const AngleSteeringParams HYUNDAI_CANFD_IONIQ_9_STEERING_PARAMS = {
+    .slip_factor = -0.0005358728290930592f,
+    .steer_ratio = 16.02f,
+    .wheelbase = 3.13f,
+  };
+
   bool tx = true;
 
   // steering
-  const unsigned int steer_addr = (safety_setup.hyundai_canfd_lka_steer_msg && !safety_setup.hyundai_longitudinal) ? hyundai_canfd_get_lka_addr() : 0x12aU;
+  const unsigned int steer_addr = safety_setup.hyundai_canfd_angle_steering ? 0xCBU :
+                                  ((safety_setup.hyundai_canfd_lka_steer_msg && !safety_setup.hyundai_longitudinal) ?
+                                   hyundai_canfd_get_lka_addr() : 0x12aU);
   if (msg->addr == steer_addr) {
-    int desired_torque = from_offset((GET_BYTES_LE(msg, 5, 2) >> 1U) & 0x7FFU, 1024);
-    bool steer_req = GET_BIT(msg, 52U);
+    if (safety_setup.hyundai_canfd_angle_steering) {
+      const uint8_t aci_level_1 = msg->data[3] & 0xFU;
+      const uint8_t aci_level_2 = msg->data[3] >> 4U;
+      const uint8_t gain_raw = msg->data[6];
+      const uint8_t emergency_active = msg->data[7] & 0x3U;
+      const uint8_t emergency_gain = msg->data[8];
+      const bool steer_req = aci_level_2 == 2U;
+      const int desired_angle = to_signed(GET_BYTES_LE(msg, 4, 2) & 0x3FFFU, 14);
+      const bool invalid_state = (aci_level_1 != 0U) || ((aci_level_2 != 1U) && (aci_level_2 != 2U)) ||
+                                 (gain_raw > 250U) || (!steer_req && (gain_raw != 0U)) ||
+                                 (emergency_active != 0U) || (emergency_gain != 0U);
+      const bool driver_override = (safety.torque_driver.min < -250) || (safety.torque_driver.max > 250);
+      const bool angle_error = (desired_angle < (safety.angle_meas.min - 200)) ||
+                               (desired_angle > (safety.angle_meas.max + 200));
 
-    if (steer_torque_cmd_checks(desired_torque, steer_req, HYUNDAI_CANFD_STEERING_LIMITS)) {
-      tx = false;
+      if (invalid_state || (steer_req && (driver_override || angle_error)) ||
+          steer_angle_cmd_checks_vm(desired_angle, steer_req, HYUNDAI_CANFD_ANGLE_STEERING_LIMITS,
+                                    HYUNDAI_CANFD_IONIQ_9_STEERING_PARAMS)) {
+        tx = false;
+      }
+    } else {
+      int desired_torque = from_offset((GET_BYTES_LE(msg, 5, 2) >> 1U) & 0x7FFU, 1024);
+      bool steer_req = GET_BIT(msg, 52U);
+
+      if (steer_torque_cmd_checks(desired_torque, steer_req, HYUNDAI_CANFD_STEERING_LIMITS)) {
+        tx = false;
+      }
     }
   }
 
@@ -209,6 +261,10 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 static safety_config hyundai_canfd_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT = 128;
   const uint16_t HYUNDAI_PARAM_CANFD_ALT_BUTTONS = 32;
+  const uint16_t HYUNDAI_PARAM_CANFD_ANGLE_STEERING = 1024;
+  const uint16_t HYUNDAI_PARAM_ANGLE_PROFILE_SHIFT = 11;
+  const uint16_t HYUNDAI_PARAM_ANGLE_PROFILE_MASK = 0x1FU;
+  const uint8_t HYUNDAI_ANGLE_PROFILE_IONIQ_9 = 1U;
 
   static const CanMsg HYUNDAI_CANFD_LKA_STEER_MSG_TX_MSGS[] = {
     HYUNDAI_CANFD_LKA_STEER_MSG_COMMON_TX_MSGS(0, 1)
@@ -237,6 +293,10 @@ static safety_config hyundai_canfd_init(uint16_t param) {
     HYUNDAI_CANFD_SCC_CONTROL_COMMON_TX_MSGS(0, false)
   };
 
+  static const CanMsg hyundai_canfd_angle_steering_tx_msgs[] = {
+    HYUNDAI_CANFD_ANGLE_STEERING_TX_MSGS
+  };
+
   // ADRV_0x160 is checked for radar liveness
   static const CanMsg HYUNDAI_CANFD_LFA_STEERING_LONG_TX_MSGS[] = {
     HYUNDAI_CANFD_CRUISE_BUTTON_TX_MSGS(2)
@@ -257,6 +317,11 @@ static safety_config hyundai_canfd_init(uint16_t param) {
 
   safety_setup.hyundai_canfd_alt_buttons = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ALT_BUTTONS);
   safety_setup.hyundai_canfd_lka_steer_msg_alt = GET_FLAG(param, HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT);
+  safety_setup.hyundai_canfd_angle_profile = (param >> HYUNDAI_PARAM_ANGLE_PROFILE_SHIFT) & HYUNDAI_PARAM_ANGLE_PROFILE_MASK;
+  safety_setup.hyundai_canfd_angle_steering = GET_FLAG(param, HYUNDAI_PARAM_CANFD_ANGLE_STEERING) &&
+                                               (safety_setup.hyundai_canfd_angle_profile == HYUNDAI_ANGLE_PROFILE_IONIQ_9) &&
+                                               safety_setup.hyundai_camera_scc && !safety_setup.hyundai_longitudinal &&
+                                               !safety_setup.hyundai_canfd_lka_steer_msg;
 
   safety_config ret;
   if (safety_setup.hyundai_longitudinal) {
@@ -293,7 +358,15 @@ static safety_config hyundai_canfd_init(uint16_t param) {
       }
     }
   } else {
-    if (safety_setup.hyundai_canfd_lka_steer_msg) {
+    if (safety_setup.hyundai_canfd_angle_steering) {
+      static const RxCheck hyundai_canfd_angle_rx_checks[] = {
+        HYUNDAI_CANFD_STD_BUTTONS_RX_CHECKS(0)
+        HYUNDAI_CANFD_SCC_ADDR_CHECK(2)
+      };
+
+      SET_RX_CHECKS(hyundai_canfd_angle_rx_checks, ret);
+      SET_TX_MSGS(hyundai_canfd_angle_steering_tx_msgs, ret);
+    } else if (safety_setup.hyundai_canfd_lka_steer_msg) {
       // *** LKA steering checks ***
       // E-CAN is on bus 1, SCC messages are sent on cars with ADRV ECU.
       // Does not use the alt buttons message

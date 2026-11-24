@@ -374,6 +374,8 @@ typedef struct {
   bool hyundai_legacy;
   bool hyundai_canfd_alt_buttons;
   bool hyundai_canfd_lka_steer_msg_alt;
+  bool hyundai_canfd_angle_steering;
+  uint8_t hyundai_canfd_angle_profile;
 
   bool nissan_alt_eps;
 

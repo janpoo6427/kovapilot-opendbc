@@ -56,6 +56,7 @@ class CarState(CarStateBase):
     self.buttons_counter = 0
 
     self.cruise_info = {}
+    self.lfa_alt = None
 
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
@@ -235,11 +236,20 @@ class CarState(CarStateBase):
                      cp.vl["WHEEL_SPEEDS"]["WHL_SpdRLVal"] <= STANDSTILL_THRESHOLD and cp.vl["WHEEL_SPEEDS"]["WHL_SpdRRVal"] <= STANDSTILL_THRESHOLD
 
     ret.steeringRateDeg = cp.vl["STEERING_SENSORS"]["STEERING_RATE"]
-    ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEERING_ANGLE"]
+    angle_invalid = False
+    if self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      steering_config = CAR(self.CP.carFingerprint).config.steering_config
+      measured_angle = cp.vl["MDPS"][steering_config.measured_angle_signal]
+      angle_invalid = measured_angle >= 3276.6
+      ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEERING_ANGLE"] if angle_invalid else measured_angle
+      if cp_cam.vl_all["LFA_ALT"]["COUNTER"]:
+        self.lfa_alt = copy.copy(cp_cam.vl["LFA_ALT"])
+    else:
+      ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEERING_ANGLE"]
     ret.steeringTorque = cp.vl["MDPS"]["MDPS_StrTqSnsrVal"]
     ret.steeringTorqueEps = cp.vl["MDPS"]["MDPS_OutTqVal"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > self.params.STEER_THRESHOLD, 5)
-    ret.steerFaultTemporary = cp.vl["MDPS"]["MDPS_LkaFailSta"] != 0
+    ret.steerFaultTemporary = cp.vl["MDPS"]["MDPS_LkaFailSta"] != 0 or angle_invalid
 
     # TODO: alt signal usage may be described by cp.vl['BLINKERS']['USE_ALT_LAMP']
     left_blinker_sig, right_blinker_sig = "LEFT_LAMP", "RIGHT_LAMP"
@@ -295,15 +305,23 @@ class CarState(CarStateBase):
 
   def get_can_parsers_canfd(self, CP):
     msgs = []
+    cam_msgs = []
+    if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      msgs.append(("MDPS", 100))
+      cam_msgs.append(("LFA_ALT", 100))
     if not (CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS):
       # TODO: this can be removed once we add dynamic support to vl_all
       msgs += [
         # this message is 50Hz but the ECU frequently stops transmitting for ~0.5s
         ("CRUISE_BUTTONS", 1)
       ]
+    if CP.flags & HyundaiFlags.HAS_BSM:
+      # This frame is bursty on some HDA2 platforms. Decode it for blind-spot
+      # state without making the entire powertrain parser invalid while quiet.
+      msgs.append(("ADAS_CMD_50_50ms", math.nan))
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
-      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], CanBus(CP).CAM),
+      Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_msgs, CanBus(CP).CAM),
     }
 
   def get_can_parsers(self, CP):

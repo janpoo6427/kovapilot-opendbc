@@ -1,6 +1,7 @@
 from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import HyundaiCanFDSteeringApi, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
+from opendbc.car.hyundai.values import (HyundaiCanFDSteeringApi, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags,
+                                        encode_angle_safety_profile)
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
@@ -166,14 +167,17 @@ class CarInterface(CarInterfaceBase):
 
     if ret.flags & HyundaiFlags.CANFD:
       steering_config = platform.config.steering_config
-      # Angle-command CAN-FD profiles remain identification-only until their
-      # controller path and panda safety model are implemented and validated.
       if steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
-        ret.dashcamOnly = True
         ret.alphaLongitudinalAvailable = False
         ret.openpilotLongitudinalControl = False
         ret.pcmCruise = True
-        ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]
+        if ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING and steering_config.control_enabled:
+          ret.safetyConfigs[-1].safetyParam &= ~HyundaiSafetyFlags.LONG.value
+          ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_ANGLE_STEERING.value
+          ret.safetyConfigs[-1].safetyParam |= encode_angle_safety_profile(steering_config.safety_profile)
+        else:
+          ret.dashcamOnly = True
+          ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]
 
     return ret
 

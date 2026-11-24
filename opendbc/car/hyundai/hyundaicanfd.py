@@ -59,6 +59,21 @@ def create_steering_messages(packer, CP, CAN, enabled, lat_active, apply_torque)
   return ret
 
 
+def create_angle_steering_message(packer, CAN, steering_config, template, lat_active, apply_angle, torque_reduction_gain):
+  values = template.copy()
+  values.pop("CHECKSUM", None)
+  values.pop("COUNTER", None)
+  values.update({
+    "ADAS_ActvACISta": 0,
+    "ADAS_ActvACILvl2Sta": steering_config.active_value if lat_active else steering_config.inactive_value,
+    "ADAS_StrAnglReqVal": apply_angle,
+    "ADAS_ACIAnglTqRedcGainVal": torque_reduction_gain / 250.0 if lat_active else 0,
+    "FCA_ESA_ActvSta": 0,
+    "FCA_ESA_TqBstGainVal": 0,
+  })
+  return packer.make_can_msg("LFA_ALT", CAN.ECAN, values)
+
+
 def create_suppress_lfa(packer, CAN, lfa_block_msg, lka_steering_alt):
   suppress_msg = "CAM_0x362" if lka_steering_alt else "CAM_0x2a4"
   msg_bytes = 32 if lka_steering_alt else 24
