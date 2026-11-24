@@ -1,18 +1,21 @@
 import unittest
 import copy
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from opendbc.can import CANPacker
 from opendbc.car import gen_empty_fingerprint
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.carcontroller import apply_hyundai_angle_limits
-from opendbc.car.hyundai.hyundaicanfd import CanBus, create_angle_steering, hkg_can_fd_checksum
+from opendbc.car.hyundai.carcontroller import CarController, apply_hyundai_angle_limits
+from opendbc.car.hyundai.hyundaicanfd import (CanBus, create_acc_control_from_stock, create_angle_steering,
+                                              hkg_can_fd_checksum)
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.hyundai.values import (CAR, DATE_FW_ECUS, CANFD_FUZZY_WHITELIST, PLATFORM_CODE_ECUS,
                                         HYUNDAI_VERSION_REQUEST_LONG, HyundaiCanFDEcuDisableStrategy, HyundaiCanFDHarnessConnection,
                                         HyundaiCanFDSteeringApi, HyundaiCanFDStockSafetyStatus, HyundaiFlags,
-                                        get_platform_codes, HyundaiSafetyFlags, match_fw_to_car_fuzzy)
+                                        DBC, get_platform_codes, HyundaiSafetyFlags, match_fw_to_car_fuzzy)
 from opendbc.car.hyundai.fingerprints import FW_VERSIONS
 from opendbc.testing import fuzzy_test
 
@@ -112,6 +115,39 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
     apply_angle, active = apply_hyundai_angle_limits(-120.0, apply_angle, 0.0, 0.0, True, True)
     self.assertFalse(active)
     self.assertEqual(apply_angle, 0.0)
+
+  def test_stock_scc_template_preserves_non_actuation_fields(self):
+    class HudControl:
+      leadDistanceBars = 3
+
+    stock = {
+      "COUNTER": 0x7E,
+      "ACC_ObjDist": 42.3,
+      "ACC_ObjRelSpd": -1.2,
+      "ObjValid": 1,
+      "SCC_ObjSta": 5,
+      "OBJ_STATUS": 6,
+      "NEW_SIGNAL_15": 12.7,
+      "ZEROS": 0x123456789ABC,
+      "NEW_SIGNAL_8": 9,
+    }
+    msg = create_acc_control_from_stock(self.packer, self.CAN, True, 0.0, 0.2, False, False, 87, HudControl(), stock)
+    address, dat, bus = msg
+
+    self.assertEqual((address, bus, len(dat)), (0x1A0, self.CAN.ECAN, 32))
+    self.assertEqual(dat[2], 0x7F)
+    self.assert_valid_crc(msg)
+
+    # Repacking the stock template must preserve every DBC-defined field other
+    # than checksum, counter, and the explicit longitudinal actuation allowlist.
+    stock_msg = self.packer.make_can_msg("SCC_CONTROL", self.CAN.ECAN, stock)
+    _, stock_dat, _ = stock_msg
+    dbc_msg = self.packer.dbc.name_to_msg["SCC_CONTROL"]
+    mutable_signals = {"CHECKSUM", "COUNTER", "ACCMode", "MainMode_ACC", "StopReq", "aReqValue", "aReqRaw", "VSetDis",
+                       "JerkLowerLimit", "JerkUpperLimit", "DISTANCE_SETTING"}
+    for name, signal in dbc_msg.sigs.items():
+      if name not in mutable_signals:
+        self.assertEqual(signal.get_raw_value(dat), signal.get_raw_value(stock_dat), name)
 
 
 class TestHyundaiFingerprint(unittest.TestCase):
@@ -293,6 +329,61 @@ class TestHyundaiFingerprint(unittest.TestCase):
       assert not wrong_fw_CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE
       assert not wrong_fw_CP.openpilotLongitudinalControl
       assert not wrong_fw_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+
+  def test_longitudinal_staging_requires_source_gate_and_exact_capability(self):
+    fingerprint = self._ioniq9_fingerprint()
+    car_fw = self._ioniq9_fw()
+
+    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
+      CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
+      assert CP.alphaLongitudinalAvailable
+      assert CP.openpilotLongitudinalControl
+      assert not CP.pcmCruise
+      assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+      assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CANFD_ANGLE_STEERING
+
+      # The source gate alone cannot authorize a missing passive capability.
+      missing = copy.deepcopy(fingerprint)
+      del missing[CanBus(None, fingerprint).CAM][0x12A]
+      missing_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, missing, car_fw, True, False, False)
+      assert not missing_CP.alphaLongitudinalAvailable
+      assert not missing_CP.openpilotLongitudinalControl
+      assert missing_CP.pcmCruise
+      assert not missing_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+
+  def test_longitudinal_staging_output_topology(self):
+    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
+      CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, False, False)
+
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    CS = SimpleNamespace(
+      out=SimpleNamespace(steeringPressed=False, steeringAngleDeg=0.0),
+      lfa_alt={},
+      cruise_info={"COUNTER": 0x20},
+    )
+    hud_control = SimpleNamespace(leadDistanceBars=2)
+    CC = SimpleNamespace(
+      enabled=True,
+      latActive=True,
+      cruiseControl=SimpleNamespace(override=False),
+    )
+
+    controller.frame = 0
+    frame_zero = controller.create_canfd_msgs(True, 0, 80, 0.1, False, hud_control, CS, CC)
+    self.assertEqual([(address, bus, len(dat)) for address, dat, bus in frame_zero],
+                     [(0xCB, controller.CAN.ECAN, 24), (0x1A0, controller.CAN.ECAN, 32)])
+    self.assertEqual(frame_zero[1][1][2], 0x21)
+
+    controller.frame = 1
+    frame_one = controller.create_canfd_msgs(True, 0, 80, 0.1, False, hud_control, CS, CC)
+    self.assertEqual([(address, bus, len(dat)) for address, dat, bus in frame_one],
+                     [(0xCB, controller.CAN.ECAN, 24)])
+
+    controller.frame = 2
+    frame_two = controller.create_canfd_msgs(True, 0, 80, 0.1, False, hud_control, CS, CC)
+    self.assertEqual([(address, bus, len(dat)) for address, dat, bus in frame_two],
+                     [(0xCB, controller.CAN.ECAN, 24), (0x1A0, controller.CAN.ECAN, 32)])
+    self.assertEqual(frame_two[1][1][2], 0x22)
 
   def test_angle_steering_config_is_complete_and_passive(self):
     for platform in CAR:

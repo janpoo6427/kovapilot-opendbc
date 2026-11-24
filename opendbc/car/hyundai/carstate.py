@@ -256,6 +256,13 @@ class CarState(CarStateBase):
       ret.leftBlindspot = bool(cp.vl["ADAS_CMD_50_50ms"]["BCW_LtIndSta"])
       ret.rightBlindspot = bool(cp.vl["ADAS_CMD_50_50ms"]["BCW_RtIndSta"])
 
+    # Preserve the full stock camera SCC frame before openpilot replaces it.
+    # The capability-qualified ADAS-harness path uses this as a template so
+    # non-actuation and warning/fault fields survive byte-for-byte.
+    cp_cruise_info = cp_cam if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else cp
+    if self.CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE:
+      self.cruise_info = copy.copy(cp_cruise_info.vl["SCC_CONTROL"])
+
     # cruise state
     # CAN FD cars enable on main button press, set available if no TCS faults preventing engagement
     ret.cruiseState.available = cp.vl["TCS"]["ACCEnable"] == 0
@@ -264,7 +271,6 @@ class CarState(CarStateBase):
       ret.cruiseState.enabled = cp.vl["TCS"]["ACC_REQ"] == 1
       ret.cruiseState.standstill = False
     else:
-      cp_cruise_info = cp_cam if self.CP.flags & HyundaiFlags.CANFD_CAMERA_SCC else cp
       ret.cruiseState.enabled = cp_cruise_info.vl["SCC_CONTROL"]["ACCMode"] in (1, 2)
       ret.cruiseState.standstill = cp_cruise_info.vl["SCC_CONTROL"]["CRUISE_STANDSTILL"] == 1
       ret.cruiseState.speed = cp_cruise_info.vl["SCC_CONTROL"]["VSetDis"] * speed_factor
@@ -311,6 +317,11 @@ class CarState(CarStateBase):
     cam_msgs = []
     if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
       cam_msgs.append(("LFA_ALT", 100))
+    if CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE:
+      # The replacement SCC_CONTROL is built from the live stock camera frame.
+      # Make loss of that template invalidate CAN instead of silently emitting
+      # a zero-filled longitudinal command.
+      cam_msgs.append(("SCC_CONTROL", 50))
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_msgs, CanBus(CP).CAM),

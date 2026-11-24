@@ -169,6 +169,40 @@ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_ov
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
 
 
+def create_acc_control_from_stock(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control,
+                                  stock_scc_control, counter=None):
+  """Replace only longitudinal actuation fields in a stock camera SCC frame.
+
+  Reconstructing the complete decoded template preserves every DBC-defined
+  object, warning, fault, and reserved field. CANPacker regenerates checksum.
+  """
+  jerk = 5
+  jerk_step = jerk / 50
+  if not enabled or gas_override:
+    accel_value, accel_raw = 0, 0
+  else:
+    accel_raw = accel
+    accel_value = np.clip(accel, accel_last - jerk_step, accel_last + jerk_step)
+
+  values = dict(stock_scc_control)
+  values.pop("CHECKSUM", None)
+  if counter is None:
+    counter = (int(stock_scc_control.get("COUNTER", 0)) + 1) % 0x100
+  values.update({
+    "COUNTER": counter,
+    "ACCMode": 0 if not enabled else (2 if gas_override else 1),
+    "MainMode_ACC": 1,
+    "StopReq": 1 if stopping else 0,
+    "aReqValue": accel_value,
+    "aReqRaw": accel_raw,
+    "VSetDis": set_speed,
+    "JerkLowerLimit": jerk if enabled else 1,
+    "JerkUpperLimit": 3.0,
+    "DISTANCE_SETTING": hud_control.leadDistanceBars,
+  })
+  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
+
+
 def create_spas_messages(packer, CAN, left_blink, right_blink):
   ret = []
 

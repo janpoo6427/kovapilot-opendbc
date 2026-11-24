@@ -68,6 +68,7 @@ class CarController(CarControllerBase):
     self.angle_limit_counter = 0
 
     self.accel_last = 0
+    self.scc_counter = None
     self.apply_torque_last = 0
     self.apply_angle_last = 0.0
     self.car_fingerprint = CP.carFingerprint
@@ -224,8 +225,18 @@ class CarController(CarControllerBase):
       elif not angle_steering:
         can_sends.extend(hyundaicanfd.create_fca_warning_light(self.packer, self.CAN, self.frame))
       if self.frame % 2 == 0:
-        can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
-                                                         set_speed_in_units, hud_control))
+        if self.CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE:
+          if self.scc_counter is None:
+            self.scc_counter = (int(CS.cruise_info.get("COUNTER", 0)) + 1) % 0x100
+          else:
+            self.scc_counter = (self.scc_counter + 1) % 0x100
+          can_sends.append(hyundaicanfd.create_acc_control_from_stock(
+            self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
+            set_speed_in_units, hud_control, CS.cruise_info, self.scc_counter,
+          ))
+        else:
+          can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping,
+                                                           CC.cruiseControl.override, set_speed_in_units, hud_control))
         self.accel_last = accel
     else:
       # button presses

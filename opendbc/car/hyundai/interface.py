@@ -16,6 +16,13 @@ Ecu = structs.CarParams.Ecu
 # Cancel button can sometimes be ACC pause/resume button, main button can also enable on some cars
 ENABLE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.cancel, ButtonType.mainCruise)
 
+# Developer-only staging gate for the capability-qualified CAN-FD angle +
+# longitudinal path. This deliberately is not a Param: enabling it requires a
+# source change and a new build. Exact passive topology and firmware matching
+# are still required below. Keep disabled until replay/shadow evidence closes
+# the stock AEB/FCW preservation gate.
+ENABLE_CANFD_LONGITUDINAL_STAGING = False
+
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
@@ -185,15 +192,22 @@ class CarInterface(CarInterfaceBase):
     if ret.flags & HyundaiFlags.CANFD:
       steering_config = cast(HyundaiCanFDPlatformConfig, platform.config).steering_config
       # Angle-command CAN-FD profiles require the exact firmware and passive
-      # topology checks above. Longitudinal remains unavailable because it
-      # replaces stock SCC_CONTROL and its AEB/FCW behavior is not validated.
+      # topology checks above. Longitudinal is additionally guarded by a
+      # source-level developer gate while stock AEB/FCW behavior is validated.
       if steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
-        ret.alphaLongitudinalAvailable = False
-        ret.openpilotLongitudinalControl = False
-        ret.pcmCruise = True
-        ret.safetyConfigs[-1].safetyParam &= ~HyundaiSafetyFlags.LONG.value
-        # Reuse the existing development-mode opt-in as a temporary staging
-        # gate. It authorizes lateral only; longitudinal stays disabled above.
+        longitudinal_staging_enabled = (ENABLE_CANFD_LONGITUDINAL_STAGING and alpha_long and
+                                         bool(ret.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE))
+        ret.alphaLongitudinalAvailable = longitudinal_staging_enabled
+        ret.openpilotLongitudinalControl = longitudinal_staging_enabled
+        ret.pcmCruise = not longitudinal_staging_enabled
+        if longitudinal_staging_enabled:
+          ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.LONG.value
+        else:
+          ret.safetyConfigs[-1].safetyParam &= ~HyundaiSafetyFlags.LONG.value
+
+        # Reuse the existing development-mode opt-in as the lateral staging
+        # gate. It does not enable longitudinal without the independent source
+        # gate and exact longitudinal capability above.
         lateral_staging_enabled = alpha_long and bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING)
         if not lateral_staging_enabled:
           ret.dashcamOnly = True
