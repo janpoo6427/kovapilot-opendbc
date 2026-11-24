@@ -283,6 +283,7 @@ class TestHyundaiFingerprint(unittest.TestCase):
       CP = CarInterface.get_params(CAR.HYUNDAI_SONATA, fingerprint, [], False, False, False)
       assert CP.radarUnavailable != radar
 
+  @patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LATERAL_STAGING", True)
   def test_angle_steering_capability_is_data_driven_and_lateral_only(self):
     fingerprint = self._ioniq9_fingerprint()
     CAN = CanBus(None, fingerprint)
@@ -442,6 +443,7 @@ class TestHyundaiFingerprint(unittest.TestCase):
       assert not wrong_fw_CP.openpilotLongitudinalControl
       assert not wrong_fw_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
 
+  @patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LATERAL_STAGING", True)
   def test_longitudinal_staging_requires_source_gate_and_exact_capability(self):
     fingerprint = self._ioniq9_fingerprint()
     car_fw = self._ioniq9_fw()
@@ -463,6 +465,7 @@ class TestHyundaiFingerprint(unittest.TestCase):
       assert missing_CP.pcmCruise
       assert not missing_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
 
+  @patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LATERAL_STAGING", True)
   def test_longitudinal_staging_output_topology(self):
     with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
       CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, False, False)

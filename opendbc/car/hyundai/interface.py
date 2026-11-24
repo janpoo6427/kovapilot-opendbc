@@ -20,7 +20,7 @@ ENABLE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.can
 # longitudinal control. These deliberately are not Params: changing either
 # requires review and a new build. Exact passive topology and firmware matching
 # are still required below, and release builds remain fail-closed for lateral.
-ENABLE_CANFD_LATERAL_STAGING = True
+ENABLE_CANFD_LATERAL_STAGING = False
 ENABLE_CANFD_LONGITUDINAL_STAGING = False
 
 
