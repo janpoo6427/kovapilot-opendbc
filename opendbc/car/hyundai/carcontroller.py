@@ -24,14 +24,44 @@ MAX_ANGLE_CONSECUTIVE_FRAMES = 2
 CANCEL_BUTTON_DELAY_FRAMES = 10
 ANGLE_ACTIVE_MEASURED_MAX = 60.0
 ANGLE_ACTIVE_COMMAND_MAX = 59.9
+ANGLE_MAX_MEASURED_ERROR = 8.0
+ANGLE_DRIVER_TORQUE_LIMIT = 250.0
+ANGLE_DRIVER_TORQUE_RELEASE = 200.0
+ANGLE_DRIVER_TORQUE_RELEASE_FRAMES = 10
+ANGLE_ENGAGE_GRACE_FRAMES = 50
 
 
-def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle, lat_active, steering_pressed):
-  angle_active = lat_active and not steering_pressed and abs(measured_angle) < ANGLE_ACTIVE_MEASURED_MAX
+def update_hyundai_angle_engage(lateral_authorized, engage_frames):
+  engage_frames = min(engage_frames + 1, ANGLE_ENGAGE_GRACE_FRAMES) if lateral_authorized else 0
+  return engage_frames >= ANGLE_ENGAGE_GRACE_FRAMES, engage_frames
+
+
+def update_hyundai_angle_handover(lat_active, steering_pressed, steering_torque, override_latched, release_frames):
+  if not lat_active:
+    return False, False, 0
+
+  if steering_pressed or abs(steering_torque) >= ANGLE_DRIVER_TORQUE_LIMIT:
+    return False, True, 0
+
+  if override_latched:
+    release_frames = release_frames + 1 if abs(steering_torque) <= ANGLE_DRIVER_TORQUE_RELEASE else 0
+    if release_frames < ANGLE_DRIVER_TORQUE_RELEASE_FRAMES:
+      return False, True, release_frames
+    override_latched = False
+    release_frames = 0
+
+  return True, override_latched, release_frames
+
+
+def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle, lat_active, authority_allowed):
+  angle_active = lat_active and authority_allowed and abs(measured_angle) < ANGLE_ACTIVE_MEASURED_MAX
   if angle_active:
     requested_angle = float(np.clip(requested_angle, -ANGLE_ACTIVE_COMMAND_MAX, ANGLE_ACTIVE_COMMAND_MAX))
   apply_angle = apply_std_steer_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle,
                                              angle_active, CarControllerParams.ANGLE_LIMITS)
+  if angle_active:
+    apply_angle = float(np.clip(apply_angle, measured_angle - ANGLE_MAX_MEASURED_ERROR,
+                                measured_angle + ANGLE_MAX_MEASURED_ERROR))
   return apply_angle, angle_active
 
 
@@ -71,6 +101,10 @@ class CarController(CarControllerBase):
     self.scc_counter = None
     self.apply_torque_last = 0
     self.apply_angle_last = 0.0
+    self.angle_active = False
+    self.angle_override_latched = False
+    self.angle_override_release_frames = 0
+    self.angle_engage_frames = 0
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
     self.cancel_counter = 0
@@ -95,8 +129,16 @@ class CarController(CarControllerBase):
 
     apply_angle = actuators.steeringAngleDeg
     if self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
-      apply_angle, _ = apply_hyundai_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
-                                                  CS.out.steeringAngleDeg, CC.latActive, CS.out.steeringPressed)
+      lateral_authorized = CC.latActive and (self.CP.openpilotLongitudinalControl or CS.out.cruiseState.enabled)
+      angle_engage_ready, self.angle_engage_frames = update_hyundai_angle_engage(lateral_authorized, self.angle_engage_frames)
+      authority_allowed, self.angle_override_latched, self.angle_override_release_frames = update_hyundai_angle_handover(
+        angle_engage_ready, CS.out.steeringPressed, CS.out.steeringTorque,
+        self.angle_override_latched, self.angle_override_release_frames,
+      )
+      apply_angle, self.angle_active = apply_hyundai_angle_limits(
+        actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
+        CS.out.steeringAngleDeg, angle_engage_ready, authority_allowed,
+      )
       self.apply_angle_last = apply_angle
 
     # accel + longitudinal
@@ -200,9 +242,9 @@ class CarController(CarControllerBase):
 
     # steering control
     if angle_steering:
-      angle_active = CC.latActive and not CS.out.steeringPressed and abs(CS.out.steeringAngleDeg) < ANGLE_ACTIVE_MEASURED_MAX
-      can_sends.append(hyundaicanfd.create_angle_steering(self.packer, self.CAN, self.frame, angle_active,
+      can_sends.append(hyundaicanfd.create_angle_steering(self.packer, self.CAN, self.frame, self.angle_active,
                                                           self.apply_angle_last, CS.lfa_alt))
+      can_sends.append(hyundaicanfd.create_angle_camera_mdps(self.packer, self.CAN, CS.mdps, self.angle_active))
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_torque))
 

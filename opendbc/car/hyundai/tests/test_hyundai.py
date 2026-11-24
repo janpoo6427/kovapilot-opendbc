@@ -8,10 +8,12 @@ from opendbc.car import Bus, gen_empty_fingerprint
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.carcontroller import CarController, apply_hyundai_angle_limits
+from opendbc.car.hyundai.carcontroller import (ANGLE_DRIVER_TORQUE_RELEASE_FRAMES, ANGLE_ENGAGE_GRACE_FRAMES,
+                                                CarController, apply_hyundai_angle_limits, update_hyundai_angle_engage,
+                                                update_hyundai_angle_handover)
 from opendbc.car.hyundai.carstate import CarState
-from opendbc.car.hyundai.hyundaicanfd import (CanBus, create_acc_control_from_stock, create_angle_steering,
-                                              hkg_can_fd_checksum)
+from opendbc.car.hyundai.hyundaicanfd import (CanBus, create_acc_control_from_stock, create_angle_camera_mdps,
+                                              create_angle_steering, hkg_can_fd_checksum)
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.hyundai.values import (CAR, DATE_FW_ECUS, CANFD_FUZZY_WHITELIST, PLATFORM_CODE_ECUS,
                                         HYUNDAI_VERSION_REQUEST_LONG, HyundaiCanFDEcuDisableStrategy, HyundaiCanFDHarnessConnection,
@@ -105,17 +107,65 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
   def test_controller_active_command_is_bounded_inside_safety_boundary(self):
     apply_angle = 0.0
     for _ in range(100):
-      apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, apply_angle, True, False)
+      apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, apply_angle, True, True)
       self.assertTrue(active)
       self.assertLessEqual(apply_angle, 59.9)
 
-    apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, 60.0, True, False)
+    apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, 60.0, True, True)
     self.assertFalse(active)
     self.assertEqual(apply_angle, 60.0)
 
-    apply_angle, active = apply_hyundai_angle_limits(-120.0, apply_angle, 0.0, 0.0, True, True)
+    apply_angle, active = apply_hyundai_angle_limits(-120.0, apply_angle, 0.0, 0.0, True, False)
     self.assertFalse(active)
     self.assertEqual(apply_angle, 0.0)
+
+  def test_controller_tracks_measurement_inside_safety_error(self):
+    apply_angle, active = apply_hyundai_angle_limits(50.0, 40.0, 15.0, 20.0, True, True)
+    self.assertTrue(active)
+    self.assertEqual(apply_angle, 28.0)
+
+  def test_driver_override_handover_requires_quiet_release_window(self):
+    allowed, latched, frames = update_hyundai_angle_handover(True, False, 251.0, False, 0)
+    self.assertFalse(allowed)
+    self.assertTrue(latched)
+    for _ in range(ANGLE_DRIVER_TORQUE_RELEASE_FRAMES - 1):
+      allowed, latched, frames = update_hyundai_angle_handover(True, False, 0.0, latched, frames)
+      self.assertFalse(allowed)
+    allowed, latched, frames = update_hyundai_angle_handover(True, False, 0.0, latched, frames)
+    self.assertTrue(allowed)
+    self.assertFalse(latched)
+    self.assertEqual(frames, 0)
+
+  def test_angle_engage_waits_for_stable_authority(self):
+    frames = 0
+    for _ in range(ANGLE_ENGAGE_GRACE_FRAMES - 1):
+      ready, frames = update_hyundai_angle_engage(True, frames)
+      self.assertFalse(ready)
+    ready, frames = update_hyundai_angle_engage(True, frames)
+    self.assertTrue(ready)
+    ready, frames = update_hyundai_angle_engage(False, frames)
+    self.assertFalse(ready)
+    self.assertEqual(frames, 0)
+
+  def test_camera_mdps_tracks_angle_state_and_preserves_faults(self):
+    template = {
+      "COUNTER": 7,
+      "MDPS_LkaToiActvSta": 1,
+      "MDPS_LkaToiUnblSta": 0,
+      "MDPS_ADASAciActvSta_Lv2": 1,
+      "MDPS_ADAS_AciFltSig_Lv2": 0,
+    }
+    address, dat, bus = create_angle_camera_mdps(self.packer, self.CAN, template, True)
+    self.assertEqual((address, bus, len(dat)), (0xEA, self.CAN.CAM, 24))
+    self.assertEqual(dat[2], 0)
+    self.assertEqual(dat[6] & 0xF, 0x4)
+    self.assertEqual(dat[18] & 0xF, 2)
+    self.assertEqual((dat[18] >> 4) & 0x7, 4)
+    self.assert_valid_crc((address, dat, bus))
+
+    _, fault_dat, _ = create_angle_camera_mdps(self.packer, self.CAN,
+                                                template | {"MDPS_ADAS_AciFltSig_Lv2": 1}, False)
+    self.assertEqual((fault_dat[18] >> 4) & 0x7, 1)
 
   def test_stock_scc_template_preserves_non_actuation_fields(self):
     class HudControl:
@@ -375,6 +425,7 @@ class TestHyundaiFingerprint(unittest.TestCase):
     CS = SimpleNamespace(
       out=SimpleNamespace(steeringPressed=False, steeringAngleDeg=0.0),
       lfa_alt={},
+      mdps={"COUNTER": 0, "MDPS_ADASAciActvSta_Lv2": 1, "MDPS_ADAS_AciFltSig_Lv2": 0},
       cruise_info={"COUNTER": 0x20},
     )
     hud_control = SimpleNamespace(leadDistanceBars=2)
@@ -385,21 +436,24 @@ class TestHyundaiFingerprint(unittest.TestCase):
     )
 
     controller.frame = 0
+    controller.angle_active = True
     frame_zero = controller.create_canfd_msgs(True, 0, 80, 0.1, False, hud_control, CS, CC)
     self.assertEqual([(address, bus, len(dat)) for address, dat, bus in frame_zero],
-                     [(0xCB, controller.CAN.ECAN, 24), (0x1A0, controller.CAN.ECAN, 32)])
-    self.assertEqual(frame_zero[1][1][2], 0x21)
+                     [(0xCB, controller.CAN.ECAN, 24), (0xEA, controller.CAN.CAM, 24),
+                      (0x1A0, controller.CAN.ECAN, 32)])
+    self.assertEqual(frame_zero[2][1][2], 0x21)
 
     controller.frame = 1
     frame_one = controller.create_canfd_msgs(True, 0, 80, 0.1, False, hud_control, CS, CC)
     self.assertEqual([(address, bus, len(dat)) for address, dat, bus in frame_one],
-                     [(0xCB, controller.CAN.ECAN, 24)])
+                     [(0xCB, controller.CAN.ECAN, 24), (0xEA, controller.CAN.CAM, 24)])
 
     controller.frame = 2
     frame_two = controller.create_canfd_msgs(True, 0, 80, 0.1, False, hud_control, CS, CC)
     self.assertEqual([(address, bus, len(dat)) for address, dat, bus in frame_two],
-                     [(0xCB, controller.CAN.ECAN, 24), (0x1A0, controller.CAN.ECAN, 32)])
-    self.assertEqual(frame_two[1][1][2], 0x22)
+                     [(0xCB, controller.CAN.ECAN, 24), (0xEA, controller.CAN.CAM, 24),
+                      (0x1A0, controller.CAN.ECAN, 32)])
+    self.assertEqual(frame_two[2][1][2], 0x22)
 
   def test_ioniq9_bursty_bsm_does_not_gate_can_validity(self):
     fingerprint = self._ioniq9_fingerprint()

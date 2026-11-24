@@ -239,9 +239,9 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
   SAFETY_MODEL = CarParams.SafetyModel.hyundaiCanfd
   SAFETY_PARAM = HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CAMERA_SCC | HyundaiSafetyFlags.CANFD_ANGLE_STEERING
 
-  TX_MSGS = [[0xCB, 0]]
-  RELAY_MALFUNCTION_ADDRS = {0: (0xCB,)}
-  FWD_BLACKLISTED_ADDRS = {2: [0xCB]}
+  TX_MSGS = [[0xCB, 0], [0xEA, 2]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0xCB,), 2: (0xEA,)}
+  FWD_BLACKLISTED_ADDRS = {0: [0xEA], 2: [0xCB]}
 
   PT_BUS = 0
   SCC_BUS = 2
@@ -267,6 +267,16 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
       **{f"BYTE{index}": 0 for index in range(9, 24)},
     }
     self._rx(self._stock_angle_msg())
+    self.stock_mdps = {
+      "COUNTER": 0,
+      "MDPS_LkaToiActvSta": 1,
+      "MDPS_LkaToiUnblSta": 0,
+      "MDPS_EstStrAnglVal": 0,
+      "MDPS_StrTqSnsrVal": 0,
+      "MDPS_ADASAciActvSta_Lv2": 1,
+      "MDPS_ADAS_AciFltSig_Lv2": 0,
+    }
+    self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, self.stock_mdps))
 
   def _angle_cmd_msg(self, angle, enabled, increment_timer=True, state=None, gain=None, counter=None, reserved=None):
     if increment_timer:
@@ -293,6 +303,19 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
 
   def _stock_angle_msg(self):
     return self.packer.make_can_msg_safety("LFA_ALT", self.SCC_BUS, self.stock_lfa)
+
+  def _camera_mdps_msg(self, enabled, values=None, template=None):
+    stock_mdps = self.stock_mdps if template is None else template
+    camera_values = stock_mdps | {
+      "MDPS_LkaToiActvSta": 0,
+      "MDPS_LkaToiUnblSta": 1,
+      "MDPS_ADASAciActvSta_Lv2": 2 if enabled else 1,
+      "MDPS_ADAS_AciFltSig_Lv2": 4 if stock_mdps["MDPS_ADAS_AciFltSig_Lv2"] == 0
+                                      else stock_mdps["MDPS_ADAS_AciFltSig_Lv2"],
+    }
+    if values is not None:
+      camera_values.update(values)
+    return self.packer.make_can_msg_safety("MDPS", 2, camera_values)
 
   def _speed_msg(self, speed, wheels=("FL", "FR", "RL", "RR")):
     values = {f"WHL_Spd{pos}Val": speed * 3.6 for pos in wheels}
@@ -387,6 +410,51 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
     self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
     self.assertTrue(self._tx(self._angle_cmd_msg(0, False)))
 
+  def test_camera_mdps_mirror_contract(self):
+    self._reset_angle_measurement(0)
+    self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, self.stock_mdps))
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(True)))
+
+  def test_camera_mdps_mirror_rejects_non_contract_changes(self):
+    for values in ({"MDPS_PaStrAnglVal": 1.0}, {"MDPS_LkaToiActvSta": 1},
+                   {"MDPS_ADASAciActvSta_Lv2": 1}, {"MDPS_ADAS_AciFltSig_Lv2": 0}):
+      self._reset_safety_hooks()
+      self._rx(self._stock_angle_msg())
+      self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, self.stock_mdps))
+      self.safety.set_controls_allowed(True)
+      self._set_prev_desired_angle(0)
+      self.assertTrue(self._tx(self._angle_cmd_msg(0, True, counter=1)))
+      self.assertFalse(self._tx(self._camera_mdps_msg(True, values)))
+
+  def test_camera_mdps_mirror_preserves_real_fault(self):
+    self._reset_safety_hooks()
+    self.stock_mdps["MDPS_ADAS_AciFltSig_Lv2"] = 1
+    self._rx(self._stock_angle_msg())
+    self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, self.stock_mdps))
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, False, counter=1)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(False)))
+
+  def test_camera_mdps_mirror_accepts_one_frame_lag_only(self):
+    self._reset_safety_hooks()
+    previous = self.stock_mdps | {"COUNTER": 10, "MDPS_EstStrAnglVal": 1.0}
+    current = self.stock_mdps | {"COUNTER": 11, "MDPS_EstStrAnglVal": 2.0}
+    self._rx(self._stock_angle_msg())
+    self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, previous))
+    self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, current))
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(2.0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(2.0, True, counter=1)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(True, {"COUNTER": 20}, previous)))
+
+    newest = self.stock_mdps | {"COUNTER": 12, "MDPS_EstStrAnglVal": 3.0}
+    self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, newest))
+    self.assertFalse(self._tx(self._camera_mdps_msg(True, {"COUNTER": 21}, previous)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(True, {"COUNTER": 22}, newest)))
+
   def test_active_angle_requires_measured_angle_inside_sixty_degrees(self):
     for measured, desired in ((60.0, 59.0), (65.0, 60.0), (-60.0, -59.0), (-65.0, -60.0)):
       self._reset_angle_measurement(measured)
@@ -442,9 +510,9 @@ class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanf
   SAFETY_PARAM = (HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CAMERA_SCC |
                   HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.LONG)
 
-  TX_MSGS = [[0xCB, 0], [0x1A0, 0]]
-  RELAY_MALFUNCTION_ADDRS = {0: (0xCB, 0x1A0)}
-  FWD_BLACKLISTED_ADDRS = {2: [0xCB, 0x1A0]}
+  TX_MSGS = [[0xCB, 0], [0xEA, 2], [0x1A0, 0]]
+  RELAY_MALFUNCTION_ADDRS = {0: (0xCB, 0x1A0), 2: (0xEA,)}
+  FWD_BLACKLISTED_ADDRS = {0: [0xEA], 2: [0xCB, 0x1A0]}
 
   DISABLED_ECU_UDS_MSG = (0x7D0, 0)
   DISABLED_ECU_ACTUATION_MSG = (0x1A0, 0)

@@ -332,6 +332,13 @@ typedef struct {
   bool hyundai_angle_stock_lfa_valid;
   uint8_t hyundai_angle_tx_counter;
   bool hyundai_angle_tx_counter_valid;
+  uint8_t hyundai_angle_stock_mdps[24];
+  bool hyundai_angle_stock_mdps_valid;
+  uint8_t hyundai_angle_stock_mdps_prev[24];
+  bool hyundai_angle_stock_mdps_prev_valid;
+  uint8_t hyundai_angle_mdps_tx_counter;
+  bool hyundai_angle_mdps_tx_counter_valid;
+  uint8_t hyundai_angle_lfa_state;
   bool tesla_stock_aeb;
   // Only rising edges while controls are not allowed are considered for these systems:
   // TODO: Only LKAS (non-emergency) is currently supported since we've only seen it

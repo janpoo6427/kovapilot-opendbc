@@ -73,6 +73,24 @@ def create_angle_steering(packer, CAN, frame, lat_active, apply_angle, lfa_alt):
   return packer.make_can_msg("LFA_ALT", CAN.ECAN, values)
 
 
+def create_angle_camera_mdps(packer, CAN, mdps, lat_active):
+  values = {key: value for key, value in mdps.items() if key != "COUNTER"}
+  values.update({
+    "MDPS_LkaToiActvSta": 0,
+    "MDPS_LkaToiUnblSta": 1,
+  })
+
+  requested_state = 2 if lat_active else 1
+  if values.get("MDPS_ADASAciActvSta_Lv2") in (1, 2):
+    values["MDPS_ADASAciActvSta_Lv2"] = requested_state
+  if values.get("MDPS_ADAS_AciFltSig_Lv2") == 0:
+    # The isolated camera must not start its own LFA while openpilot owns the
+    # LFA_ALT path. Preserve every real MDPS/external fault unchanged.
+    values["MDPS_ADAS_AciFltSig_Lv2"] = 4
+
+  return packer.make_can_msg("MDPS", CAN.CAM, values)
+
+
 def create_suppress_lfa(packer, CAN, lfa_block_msg, lka_steering_alt):
   suppress_msg = "CAM_0x362" if lka_steering_alt else "CAM_0x2a4"
   msg_bytes = 32 if lka_steering_alt else 24
