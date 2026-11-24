@@ -426,6 +426,16 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
       self._rx(self._angle_meas_msg(0, **values))
       self.assertFalse(self.safety.get_controls_allowed())
 
+  def test_mdps_lv2_fault_semantics(self):
+    # 2 is an external ADAS-source fault, not an MDPS measurement or actuator
+    # fault. MDPS-internal faults and temporarily-unavailable states remain
+    # immediate disengagement conditions.
+    for status in range(8):
+      self._reset_safety_hooks()
+      self.safety.set_controls_allowed(True)
+      self._rx(self._angle_meas_msg(0, MDPS_ADAS_AciFltSig_Lv2=status))
+      self.assertEqual(status in (0, 2), self.safety.get_controls_allowed(), status)
+
 
 class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanfdAngleSteering):
 

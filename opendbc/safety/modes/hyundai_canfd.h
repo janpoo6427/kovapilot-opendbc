@@ -84,8 +84,14 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     if (safety_setup.hyundai_canfd_angle_steering) {
       const uint16_t raw_angle = GET_BYTES_LE(msg, 16, 2);
       const bool valid_angle = (raw_angle != 0x7FFEU) && (raw_angle != 0x7FFFU);
+      // Lv2 value 2 means "Fault Except MDPS". This is an external ADAS
+      // source fault and does not invalidate the MDPS angle measurement or
+      // actuator. Keep blocking MDPS-internal faults (bit 0) and every
+      // temporarily-unavailable state (bit 2).
+      const uint8_t lv2_fault = (msg->data[18] >> 4U) & 0x7U;
+      const bool lv2_mdps_unavailable = ((lv2_fault & 0x1U) != 0U) || ((lv2_fault & 0x4U) != 0U);
       const bool mdps_fault = ((msg->data[3] & 0x7U) != 0U) || (((msg->data[6] >> 6U) & 0x3U) != 0U) ||
-                              (((msg->data[15] >> 6U) & 0x3U) != 0U) || (((msg->data[18] >> 4U) & 0x7U) != 0U);
+                              (((msg->data[15] >> 6U) & 0x3U) != 0U) || lv2_mdps_unavailable;
       if (valid_angle && !mdps_fault) {
         update_sample(&safety.angle_meas, to_signed(raw_angle, 16));
       } else {
