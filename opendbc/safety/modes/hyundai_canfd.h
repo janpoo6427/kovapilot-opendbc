@@ -65,11 +65,18 @@ static uint32_t hyundai_canfd_get_checksum(const CANPacket_t *msg) {
   return chksum;
 }
 
+static uint8_t hyundai_canfd_camera_mdps_state(uint8_t camera_state, uint8_t mdps_state) {
+  const bool camera_operational = (camera_state == 1U) || (camera_state == 2U);
+  const bool mdps_operational = (mdps_state == 1U) || (mdps_state == 2U);
+  return (camera_operational && mdps_operational) ? camera_state : mdps_state;
+}
+
 static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   const unsigned pt_bus = safety_setup.hyundai_canfd_lka_steer_msg ? 1U : 0U;
   const unsigned int scc_bus = safety_setup.hyundai_camera_scc ? 2U : pt_bus;
 
   if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0xCBU, 2U)) {
+    safety.hyundai_angle_stock_lfa_state = msg->data[3] >> 4U;
     for (uint8_t i = 7U; i < 24U; i++) {
       safety.hyundai_angle_stock_lfa[i - 7U] = msg->data[i];
     }
@@ -243,9 +250,6 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
       safety.hyundai_angle_tx_counter = counter;
       safety.hyundai_angle_tx_counter_valid = true;
     }
-    if (tx) {
-      safety.hyundai_angle_lfa_state = state;
-    }
   }
 
   if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0xEAU, 2U)) {
@@ -265,16 +269,24 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
     const uint8_t current_stock_fault = (safety.hyundai_angle_stock_mdps[18] >> 4U) & 0x7U;
     const uint8_t previous_stock_fault = (safety.hyundai_angle_stock_mdps_prev[18] >> 4U) & 0x7U;
     const uint8_t requested_fault = (msg->data[18] >> 4U) & 0x7U;
+    // Reflect the CAM-side request only for operational Lv2 states. Preserve
+    // the measured MDPS state otherwise, including fault or unavailable states.
+    const uint8_t camera_state = safety.hyundai_angle_stock_lfa_state;
+    const uint8_t expected_current_state = hyundai_canfd_camera_mdps_state(camera_state, safety.hyundai_angle_stock_mdps[18] & 0xFU);
+    const uint8_t expected_previous_state = hyundai_canfd_camera_mdps_state(camera_state, safety.hyundai_angle_stock_mdps_prev[18] & 0xFU);
+    const uint8_t sent_mdps_state = msg->data[18] & 0xFU;
     current_payload_matches = current_payload_matches &&
+                              (sent_mdps_state == expected_current_state) &&
                               ((msg->data[6] & 0xF0U) == (safety.hyundai_angle_stock_mdps[6] & 0xF0U)) &&
                               (requested_fault == (current_stock_fault == 0U ? 4U : current_stock_fault)) &&
                               ((msg->data[18] & 0x80U) == (safety.hyundai_angle_stock_mdps[18] & 0x80U));
     previous_payload_matches = previous_payload_matches &&
+                               (sent_mdps_state == expected_previous_state) &&
                                ((msg->data[6] & 0xF0U) == (safety.hyundai_angle_stock_mdps_prev[6] & 0xF0U)) &&
                                (requested_fault == (previous_stock_fault == 0U ? 4U : previous_stock_fault)) &&
                                ((msg->data[18] & 0x80U) == (safety.hyundai_angle_stock_mdps_prev[18] & 0x80U));
     const bool payload_violation = ((msg->data[6] & 0xFU) != 0x4U) ||
-                                   ((msg->data[18] & 0xFU) != safety.hyundai_angle_lfa_state) ||
+                                   !safety.hyundai_angle_stock_lfa_valid ||
                                    (!current_payload_matches && !previous_payload_matches);
 
     if (checksum_violation || counter_violation || payload_violation) {

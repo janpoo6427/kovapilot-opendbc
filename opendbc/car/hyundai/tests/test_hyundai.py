@@ -187,25 +187,31 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
     self.assertFalse(ready)
     self.assertEqual(frames, 0)
 
-  def test_camera_mdps_tracks_angle_state_and_preserves_faults(self):
+  def test_camera_mdps_tracks_stock_lfa_request_and_preserves_faults(self):
     template = {
       "COUNTER": 7,
       "MDPS_LkaToiActvSta": 1,
       "MDPS_LkaToiUnblSta": 0,
-      "MDPS_ADASAciActvSta_Lv2": 1,
+      "MDPS_ADASAciActvSta_Lv2": 2,
       "MDPS_ADAS_AciFltSig_Lv2": 0,
     }
-    address, dat, bus = create_angle_camera_mdps(self.packer, self.CAN, template, True)
+    address, dat, bus = create_angle_camera_mdps(self.packer, self.CAN, template, {"ADAS_ActvACILvl2Sta": 1})
     self.assertEqual((address, bus, len(dat)), (0xEA, self.CAN.CAM, 24))
     self.assertEqual(dat[2], 0)
     self.assertEqual(dat[6] & 0xF, 0x4)
-    self.assertEqual(dat[18] & 0xF, 2)
+    self.assertEqual(dat[18] & 0xF, 1)
     self.assertEqual((dat[18] >> 4) & 0x7, 4)
     self.assert_valid_crc((address, dat, bus))
 
     _, fault_dat, _ = create_angle_camera_mdps(self.packer, self.CAN,
-                                                template | {"MDPS_ADAS_AciFltSig_Lv2": 1}, False)
+                                               template | {"MDPS_ADAS_AciFltSig_Lv2": 1, "MDPS_ADASAciActvSta_Lv2": 3},
+                                               {"ADAS_ActvACILvl2Sta": 2})
     self.assertEqual((fault_dat[18] >> 4) & 0x7, 1)
+    self.assertEqual(fault_dat[18] & 0xF, 3)
+
+    _, stock_active, _ = create_angle_camera_mdps(self.packer, self.CAN, template | {"MDPS_ADASAciActvSta_Lv2": 1},
+                                                  {"ADAS_ActvACILvl2Sta": 2})
+    self.assertEqual(stock_active[18] & 0xF, 2)
 
   def test_stock_scc_template_preserves_non_actuation_fields(self):
     class HudControl:

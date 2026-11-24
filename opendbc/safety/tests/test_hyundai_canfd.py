@@ -261,6 +261,7 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
     self.angle_frame = 0
     super().setUp()
     self.stock_lfa = {
+      "ADAS_ActvACILvl2Sta": 1,
       "FCA_ESA_ActvSta": 0,
       "BYTE7_RESERVED": 0,
       "FCA_ESA_TqBstGainVal": 0,
@@ -304,12 +305,12 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
   def _stock_angle_msg(self):
     return self.packer.make_can_msg_safety("LFA_ALT", self.SCC_BUS, self.stock_lfa)
 
-  def _camera_mdps_msg(self, enabled, values=None, template=None):
+  def _camera_mdps_msg(self, state, values=None, template=None):
     stock_mdps = self.stock_mdps if template is None else template
     camera_values = stock_mdps | {
       "MDPS_LkaToiActvSta": 0,
       "MDPS_LkaToiUnblSta": 1,
-      "MDPS_ADASAciActvSta_Lv2": 2 if enabled else 1,
+      "MDPS_ADASAciActvSta_Lv2": state,
       "MDPS_ADAS_AciFltSig_Lv2": 4 if stock_mdps["MDPS_ADAS_AciFltSig_Lv2"] == 0
                                       else stock_mdps["MDPS_ADAS_AciFltSig_Lv2"],
     }
@@ -419,27 +420,38 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
     self.safety.set_controls_allowed(True)
     self._set_prev_desired_angle(0)
     self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
-    self.assertTrue(self._tx(self._camera_mdps_msg(True)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(1, {"COUNTER": 10})))
+    self.assertFalse(self._tx(self._camera_mdps_msg(2, {"COUNTER": 11})))
+
+    self.stock_lfa["ADAS_ActvACILvl2Sta"] = 2
+    self.assertTrue(self._rx(self._stock_angle_msg()))
+    self.safety.set_controls_allowed(False)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, False)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(2, {"COUNTER": 12})))
+    self.assertFalse(self.safety.get_controls_allowed())
 
   def test_camera_mdps_mirror_rejects_non_contract_changes(self):
     for values in ({"MDPS_PaStrAnglVal": 1.0}, {"MDPS_LkaToiActvSta": 1},
-                   {"MDPS_ADASAciActvSta_Lv2": 1}, {"MDPS_ADAS_AciFltSig_Lv2": 0}):
+                   {"MDPS_ADASAciActvSta_Lv2": 2}, {"MDPS_ADAS_AciFltSig_Lv2": 0}):
       self._reset_safety_hooks()
       self._rx(self._stock_angle_msg())
       self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, self.stock_mdps))
       self.safety.set_controls_allowed(True)
       self._set_prev_desired_angle(0)
       self.assertTrue(self._tx(self._angle_cmd_msg(0, True, counter=1)))
-      self.assertFalse(self._tx(self._camera_mdps_msg(True, values)))
+      self.assertFalse(self._tx(self._camera_mdps_msg(1, values)))
 
   def test_camera_mdps_mirror_preserves_real_fault(self):
     self._reset_safety_hooks()
-    self.stock_mdps["MDPS_ADAS_AciFltSig_Lv2"] = 1
+    self.stock_mdps |= {"MDPS_ADAS_AciFltSig_Lv2": 1, "MDPS_ADASAciActvSta_Lv2": 3}
+    self.stock_lfa["ADAS_ActvACILvl2Sta"] = 2
     self._rx(self._stock_angle_msg())
     self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, self.stock_mdps))
     self.safety.set_controls_allowed(False)
     self.assertTrue(self._tx(self._angle_cmd_msg(0, False, counter=1)))
-    self.assertTrue(self._tx(self._camera_mdps_msg(False)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(3, {"COUNTER": 10})))
+    self.assertFalse(self._tx(self._camera_mdps_msg(2, {"COUNTER": 11})))
+    self.assertFalse(self._tx(self._camera_mdps_msg(3, {"COUNTER": 12, "MDPS_ADAS_AciFltSig_Lv2": 4})))
 
   def test_camera_mdps_mirror_accepts_one_frame_lag_only(self):
     self._reset_safety_hooks()
@@ -451,12 +463,12 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
     self.safety.set_controls_allowed(True)
     self._set_prev_desired_angle(2.0)
     self.assertTrue(self._tx(self._angle_cmd_msg(2.0, True, counter=1)))
-    self.assertTrue(self._tx(self._camera_mdps_msg(True, {"COUNTER": 20}, previous)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(1, {"COUNTER": 20}, previous)))
 
     newest = self.stock_mdps | {"COUNTER": 12, "MDPS_EstStrAnglVal": 3.0}
     self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, newest))
-    self.assertFalse(self._tx(self._camera_mdps_msg(True, {"COUNTER": 21}, previous)))
-    self.assertTrue(self._tx(self._camera_mdps_msg(True, {"COUNTER": 22}, newest)))
+    self.assertFalse(self._tx(self._camera_mdps_msg(1, {"COUNTER": 21}, previous)))
+    self.assertTrue(self._tx(self._camera_mdps_msg(1, {"COUNTER": 22}, newest)))
 
   def test_active_angle_requires_measured_angle_inside_sixty_degrees(self):
     for measured, desired in ((60.0, 59.0), (65.0, 60.0), (-60.0, -59.0), (-65.0, -60.0)):

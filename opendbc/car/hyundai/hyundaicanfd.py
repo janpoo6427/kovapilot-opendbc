@@ -73,15 +73,16 @@ def create_angle_steering(packer, CAN, frame, lat_active, apply_angle, torque_re
   return packer.make_can_msg("LFA_ALT", CAN.ECAN, values)
 
 
-def create_angle_camera_mdps(packer, CAN, mdps, lat_active):
+def create_angle_camera_mdps(packer, CAN, mdps, lfa_alt):
   values = {key: value for key, value in mdps.items() if key != "COUNTER"}
   values.update({
     "MDPS_LkaToiActvSta": 0,
     "MDPS_LkaToiUnblSta": 1,
   })
 
-  requested_state = 2 if lat_active else 1
-  if values.get("MDPS_ADASAciActvSta_Lv2") in (1, 2):
+  # The isolated camera compares this reply with its own LFA request.
+  requested_state = lfa_alt.get("ADAS_ActvACILvl2Sta")
+  if requested_state in (1, 2) and values.get("MDPS_ADASAciActvSta_Lv2") in (1, 2):
     values["MDPS_ADASAciActvSta_Lv2"] = requested_state
   if values.get("MDPS_ADAS_AciFltSig_Lv2") == 0:
     # The isolated camera must not start its own LFA while openpilot owns the

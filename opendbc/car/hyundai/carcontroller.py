@@ -300,7 +300,7 @@ class CarController(CarControllerBase):
     if angle_steering:
       can_sends.append(hyundaicanfd.create_angle_steering(self.packer, self.CAN, self.frame, self.angle_active,
                                                           self.apply_angle_last, self.angle_torque_reduction_gain, CS.lfa_alt))
-      can_sends.append(hyundaicanfd.create_angle_camera_mdps(self.packer, self.CAN, CS.mdps, self.angle_active))
+      can_sends.append(hyundaicanfd.create_angle_camera_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt))
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, CC.enabled, apply_steer_req, apply_torque))
 
