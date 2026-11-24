@@ -1,6 +1,8 @@
+from typing import cast
+
 from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import HyundaiCanFDSteeringApi, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
+from opendbc.car.hyundai.values import HyundaiCanFDPlatformConfig, HyundaiCanFDSteeringApi, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
@@ -29,6 +31,7 @@ class CarInterface(CarInterfaceBase):
 
     if ret.flags & HyundaiFlags.CANFD:
       # Shared configuration for CAN-FD cars
+      canfd_config = cast(HyundaiCanFDPlatformConfig, platform.config)
 
       # "LKA steering" if LKAS or LKAS_ALT messages are seen coming from the camera.
       # Generally means our LKAS message is forwarded to another ECU (commonly ADAS ECU)
@@ -38,20 +41,26 @@ class CarInterface(CarInterfaceBase):
       lka_steering = 0x50 in fingerprint[cam_can] or 0x110 in fingerprint[cam_can]
       CAN = CanBus(None, fingerprint, lka_steering)
 
-      steering_config = platform.config.steering_config
-      angle_steering = steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
-      if angle_steering:
+      steering_config = canfd_config.steering_config
+      longitudinal_config = canfd_config.longitudinal_config
+      observed_firmware = {(fw.ecu.raw, fw.address, bytes(fw.fwVersion)) for fw in car_fw}
+
+      def capability_matches(required_messages, required_firmware):
         topology_matches = all(
           fingerprint[getattr(CAN, requirement.role.value)].get(requirement.address) == requirement.dlc
-          for requirement in steering_config.required_messages
+          for requirement in required_messages
         )
-        observed_firmware = {(fw.ecu.raw, fw.address, bytes(fw.fwVersion)) for fw in car_fw}
         firmware_matches = all(
           (requirement.ecu, requirement.address, requirement.version) in observed_firmware
-          for requirement in steering_config.required_firmware
+          for requirement in required_firmware
         )
-        if topology_matches and firmware_matches:
-          ret.flags |= HyundaiFlags.CANFD_ANGLE_STEERING.value
+        return topology_matches and firmware_matches
+
+      angle_steering = steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
+      if angle_steering and capability_matches(steering_config.required_messages, steering_config.required_firmware):
+        ret.flags |= HyundaiFlags.CANFD_ANGLE_STEERING.value
+      if longitudinal_config.configured and capability_matches(longitudinal_config.required_messages, longitudinal_config.required_firmware):
+        ret.flags |= HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE.value
 
       ret.alphaLongitudinalAvailable = not (ret.flags & HyundaiFlags.CANFD_NO_RADAR_DISABLE)
       if lka_steering and Ecu.adas not in [fw.ecu for fw in car_fw]:
@@ -174,7 +183,7 @@ class CarInterface(CarInterfaceBase):
       ret.dashcamOnly = True
 
     if ret.flags & HyundaiFlags.CANFD:
-      steering_config = platform.config.steering_config
+      steering_config = cast(HyundaiCanFDPlatformConfig, platform.config).steering_config
       # Angle-command CAN-FD profiles require the exact firmware and passive
       # topology checks above. Longitudinal remains unavailable because it
       # replaces stock SCC_CONTROL and its AEB/FCW behavior is not validated.

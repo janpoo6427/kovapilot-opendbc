@@ -159,6 +159,9 @@ class HyundaiFlags(IntFlag):
   # The platform uses the CAN-FD LFA_ALT angle steering API. This flag is set
   # only after the platform capability and observed CAN topology agree.
   CANFD_ANGLE_STEERING = 2 ** 28
+  # Passive evidence matches a typed CAN-FD longitudinal profile. This is a
+  # candidate flag only and does not enable longitudinal control or safety.
+  CANFD_LONGITUDINAL_CANDIDATE = 2 ** 29
 
 
 @dataclass
@@ -188,6 +191,23 @@ class HyundaiCanFDBusRole(Enum):
   ECAN = "ECAN"
 
 
+class HyundaiCanFDHarnessConnection(Enum):
+  UNKNOWN = "unknown"
+  ADAS = "adas"
+
+
+class HyundaiCanFDEcuDisableStrategy(Enum):
+  UNCONFIGURED = "unconfigured"
+  NONE = "none"
+  RADAR = "radar"
+  ADAS = "adas"
+
+
+class HyundaiCanFDStockSafetyStatus(Enum):
+  UNVERIFIED = "unverified"
+  PRESERVED = "preserved"
+
+
 @dataclass(frozen=True)
 class HyundaiCanFDMessageRequirement:
   role: HyundaiCanFDBusRole
@@ -214,10 +234,45 @@ class HyundaiCanFDSteeringConfig:
   required_firmware: tuple[HyundaiFirmwareRequirement, ...] = ()
 
 
+@dataclass(frozen=True)
+class HyundaiCanFDLongitudinalConfig:
+  harness_connection: HyundaiCanFDHarnessConnection = HyundaiCanFDHarnessConnection.UNKNOWN
+  stock_scc_bus: HyundaiCanFDBusRole | None = None
+  command_bus: HyundaiCanFDBusRole | None = None
+  command_address: int | None = None
+  command_dlc: int | None = None
+  command_frequency_hz: int | None = None
+  ecu_disable_strategy: HyundaiCanFDEcuDisableStrategy = HyundaiCanFDEcuDisableStrategy.UNCONFIGURED
+  stock_aeb_fcw_status: HyundaiCanFDStockSafetyStatus = HyundaiCanFDStockSafetyStatus.UNVERIFIED
+  required_messages: tuple[HyundaiCanFDMessageRequirement, ...] = ()
+  required_firmware: tuple[HyundaiFirmwareRequirement, ...] = ()
+
+  def __post_init__(self):
+    command_fields = (self.stock_scc_bus, self.command_bus, self.command_address, self.command_dlc, self.command_frequency_hz)
+    if any(field is not None for field in command_fields) != all(field is not None for field in command_fields):
+      raise ValueError("CAN-FD longitudinal command metadata must be complete")
+    if self.configured:
+      if self.command_dlc is None or self.command_frequency_hz is None:
+        raise ValueError("configured CAN-FD longitudinal profiles require command metadata")
+      if self.harness_connection == HyundaiCanFDHarnessConnection.UNKNOWN:
+        raise ValueError("configured CAN-FD longitudinal profiles require a harness connection")
+      if self.ecu_disable_strategy == HyundaiCanFDEcuDisableStrategy.UNCONFIGURED:
+        raise ValueError("configured CAN-FD longitudinal profiles require an ECU disable strategy")
+      if self.command_dlc <= 0 or self.command_frequency_hz <= 0:
+        raise ValueError("configured CAN-FD longitudinal profiles require positive DLC and frequency")
+      if not self.required_messages or not self.required_firmware:
+        raise ValueError("configured CAN-FD longitudinal profiles require passive evidence")
+
+  @property
+  def configured(self) -> bool:
+    return self.command_address is not None
+
+
 @dataclass
 class HyundaiCanFDPlatformConfig(PlatformConfig):
   dbc_dict: DbcDict = field(default_factory=lambda: {Bus.pt: "hyundai_canfd_generated"})
   steering_config: HyundaiCanFDSteeringConfig = field(default_factory=HyundaiCanFDSteeringConfig)
+  longitudinal_config: HyundaiCanFDLongitudinalConfig = field(default_factory=HyundaiCanFDLongitudinalConfig)
 
   def init(self):
     self.flags |= HyundaiFlags.CANFD
@@ -441,6 +496,34 @@ class CAR(Platforms):
         HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x175, 24),
         HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x1CF, 8),
         HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xEA, 24),
+      ),
+      required_firmware=(
+        HyundaiFirmwareRequirement(Ecu.fwdRadar, 0x7D0, b'\xf1\x00MEev RDR -----      1.00 1.00 99110-GO000         '),
+        HyundaiFirmwareRequirement(Ecu.fwdCamera, 0x7C4, b'\xf1\x00ME  MFC  AT KOR LHD 1.00 1.01 99211-GO000 250103'),
+        HyundaiFirmwareRequirement(Ecu.adas, 0x730, b'\xf1\x00ME  FBL5 1.00 1.01 250122'),
+      ),
+    ),
+    longitudinal_config=HyundaiCanFDLongitudinalConfig(
+      # The physical harness is connected at the ADAS module, while passive
+      # evidence shows stock SCC_CONTROL arriving on CAM and replacement
+      # SCC_CONTROL being transmitted on ECAN. The two facts are independent.
+      harness_connection=HyundaiCanFDHarnessConnection.ADAS,
+      stock_scc_bus=HyundaiCanFDBusRole.CAM,
+      command_bus=HyundaiCanFDBusRole.ECAN,
+      command_address=0x1A0,
+      command_dlc=32,
+      command_frequency_hz=50,
+      # The known-good route does not disable 0x730 or 0x7D0. Activation stays
+      # prohibited until stock AEB/FCW preservation is independently proven.
+      ecu_disable_strategy=HyundaiCanFDEcuDisableStrategy.NONE,
+      stock_aeb_fcw_status=HyundaiCanFDStockSafetyStatus.UNVERIFIED,
+      required_messages=(
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x1A0, 32),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x12A, 16),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x35, 32),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xA0, 24),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x175, 24),
+        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x1CF, 8),
       ),
       required_firmware=(
         HyundaiFirmwareRequirement(Ecu.fwdRadar, 0x7D0, b'\xf1\x00MEev RDR -----      1.00 1.00 99110-GO000         '),
