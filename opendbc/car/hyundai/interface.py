@@ -16,11 +16,11 @@ Ecu = structs.CarParams.Ecu
 # Cancel button can sometimes be ACC pause/resume button, main button can also enable on some cars
 ENABLE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.cancel, ButtonType.mainCruise)
 
-# Developer-only staging gate for the capability-qualified CAN-FD angle +
-# longitudinal path. This deliberately is not a Param: enabling it requires a
-# source change and a new build. Exact passive topology and firmware matching
-# are still required below. Keep disabled until replay/shadow evidence closes
-# the stock AEB/FCW preservation gate.
+# Source-level staging gates for capability-qualified CAN-FD angle and
+# longitudinal control. These deliberately are not Params: changing either
+# requires review and a new build. Exact passive topology and firmware matching
+# are still required below, and release builds remain fail-closed for lateral.
+ENABLE_CANFD_LATERAL_STAGING = True
 ENABLE_CANFD_LONGITUDINAL_STAGING = False
 
 
@@ -205,10 +205,8 @@ class CarInterface(CarInterfaceBase):
         else:
           ret.safetyConfigs[-1].safetyParam &= ~HyundaiSafetyFlags.LONG.value
 
-        # Reuse the existing development-mode opt-in as the lateral staging
-        # gate. It does not enable longitudinal without the independent source
-        # gate and exact longitudinal capability above.
-        lateral_staging_enabled = alpha_long and bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING)
+        lateral_staging_enabled = (ENABLE_CANFD_LATERAL_STAGING and not is_release and
+                                   bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING))
         if not lateral_staging_enabled:
           ret.dashcamOnly = True
           ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]

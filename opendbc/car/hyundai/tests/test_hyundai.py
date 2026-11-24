@@ -196,10 +196,15 @@ class TestHyundaiFingerprint(unittest.TestCase):
 
     # Fingerprinting supplies a string in production. Experimental longitudinal
     # must not weaken the lateral-only safety boundary.
-    passive_CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, False, False, False)
-    assert passive_CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
-    assert passive_CP.dashcamOnly
-    assert passive_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+    CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, False, False, False)
+    assert CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
+    assert not CP.dashcamOnly
+    assert CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.hyundaiCanfd
+    assert CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.CANFD_ANGLE_STEERING
+    assert not CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.LONG
+    assert not CP.alphaLongitudinalAvailable
+    assert not CP.openpilotLongitudinalControl
+    assert CP.pcmCruise
 
     CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, True, False, False)
     assert steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
@@ -213,6 +218,16 @@ class TestHyundaiFingerprint(unittest.TestCase):
     assert not CP.alphaLongitudinalAvailable
     assert not CP.openpilotLongitudinalControl
     assert CP.pcmCruise
+
+    # Source gate and release builds remain fail-closed even with exact evidence.
+    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LATERAL_STAGING", False):
+      gated_CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, False, False, False)
+    assert gated_CP.dashcamOnly
+    assert gated_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+
+    release_CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, False, True, False)
+    assert release_CP.dashcamOnly
+    assert release_CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
 
     longitudinal_config = CAR.HYUNDAI_IONIQ_9.config.longitudinal_config
     assert longitudinal_config.harness_connection == HyundaiCanFDHarnessConnection.ADAS
