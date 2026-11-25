@@ -229,6 +229,14 @@ struct CarState {
   fuelGauge @41 :Float32; # battery or fuel tank level from [0.0, 1.0]
   charging @43 :Bool;
 
+  trailerState @62 :TrailerState; # passive observation
+
+  enum TrailerState {
+    unknown @0;
+    disconnected @1;
+    connected @2;
+  }
+
   struct WheelSpeeds {
     # optional wheel speeds
     fl @0 :Float32;

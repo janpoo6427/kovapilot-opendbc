@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, gen_empty_fingerprint
-from opendbc.car.structs import CarParams
+from opendbc.car.can_definitions import CanData
+from opendbc.car.structs import CarParams, CarState as CarStateMessage
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.carcontroller import (ANGLE_DRIVER_TORQUE_LIMIT, ANGLE_DRIVER_TORQUE_RELEASE_FRAMES,
@@ -512,6 +513,44 @@ class TestHyundaiFingerprint(unittest.TestCase):
 
     pt_parser = CarState(CP).get_can_parsers(CP)[Bus.pt]
     assert pt_parser.message_states[0x1BA].ignore_alive
+
+  def test_trailer_status_only_changes_telemetry(self):
+    fingerprint = self._ioniq9_fingerprint()
+    params = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, self._ioniq9_fw(), False, False, False)
+    bus = CanBus(params).ECAN
+    reference = CarInterface(params)
+    reference.trailer_observer = None
+    interface = CarInterface(params)
+    packer = CANPacker("hyundai_canfd_generated")
+    assert params.dashcamOnly
+    assert params.safetyConfigs[0].safetyModel == CarParams.SafetyModel.noOutput
+    assert 0x437 not in interface.can_parsers[Bus.pt].addresses
+
+    # The first CarState update registers the lazily parsed stock messages.
+    reference.update([])
+    interface.update([])
+    for timestamp, connected, expected in ((1, None, "unknown"), (2, 0, "disconnected"), (3, 1, "connected")):
+      frames = [CanData(*packer.make_can_msg(message.name, parser.bus, {}))
+                for parser in interface.can_parsers.values() for message in parser.message_states.values()]
+      if connected is not None:
+        frames.append(CanData(0x437, bytes([connected]) + bytes(7), bus))
+      packets = [(timestamp * 10_000_000, frames)]
+      baseline = reference.update(packets).to_dict()
+      state = interface.update(packets)
+      assert state.canValid and not state.canTimeout
+      self.assertEqual(state.trailerState, expected)
+      with CarStateMessage.from_bytes(state.to_bytes()) as decoded:
+        self.assertEqual(decoded.trailerState, expected)
+      observed = state.to_dict()
+      observed.pop("trailerState")
+      baseline.pop("trailerState", None)
+      self.assertEqual(observed, baseline)
+
+  def test_trailer_status_ignored_without_matching_capability(self):
+    params = CarInterface.get_non_essential_params(CAR.HYUNDAI_IONIQ_9)
+    interface = CarInterface(params)
+    frame = CanData(0x437, b"\x01" + bytes(7), CanBus(params).ECAN)
+    self.assertEqual(interface.update([(1, [frame])]).trailerState, "unknown")
 
   def test_angle_steering_config_is_complete_and_passive(self):
     for platform in CAR:

@@ -1,6 +1,7 @@
 from typing import cast
 
 from opendbc.car import Bus, get_safety_config, structs, uds
+from opendbc.car.can_definitions import CanData
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiCanFDPlatformConfig, HyundaiCanFDSteeringApi, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
@@ -9,6 +10,7 @@ from opendbc.car.disable_ecu import disable_ecu
 from opendbc.car.hyundai.carcontroller import CarController
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.radar_interface import RadarInterface
+from opendbc.car.hyundai.trailer import TrailerStateObserver
 
 ButtonType = structs.CarState.ButtonEvent.Type
 Ecu = structs.CarParams.Ecu
@@ -30,6 +32,18 @@ class CarInterface(CarInterfaceBase):
   RadarInterface = RadarInterface
 
   DRIVABLE_GEARS = (structs.CarState.GearShifter.sport, structs.CarState.GearShifter.manumatic)
+
+  def __init__(self, CP: structs.CarParams):
+    super().__init__(CP)
+    self.trailer_observer = None
+    if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      self.trailer_observer = TrailerStateObserver(CanBus(CP).ECAN)
+
+  def update(self, can_packets: list[tuple[int, list[CanData]]]) -> structs.CarState:
+    state = super().update(can_packets)
+    if self.trailer_observer is not None:
+      state.trailerState = self.trailer_observer.update(can_packets)
+    return state
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
