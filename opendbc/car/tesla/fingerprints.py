@@ -60,6 +60,13 @@ FW_VERSIONS = {
       b'TeMYG4_Main_0.0.0 (92),Y4003.10.2',
     ],
   },
+  CAR.TESLA_MODEL_Y_HW45: {
+    # Observed on Japan-market 2026 Model Y.
+    (Ecu.eps, 0x730, None): [
+      b'TeMYG4_Main_0.0.0 (87),DL005.08.3',
+      b'TeMYG4_Main_0.0.0 (92),Y4OC003.11.2',
+    ],
+  },
   CAR.TESLA_MODEL_X: {
     (Ecu.eps, 0x730, None): [
       b'TeM3_SP_XP002p2_0.0.0 (23),XPR003.6.0',

@@ -41,6 +41,16 @@ class TeslaPlatformConfig(PlatformConfig):
   dbc_dict: DbcDict = field(default_factory=lambda: {Bus.party: 'tesla_model3_party'})
 
 
+class TeslaFlags(IntFlag):
+  LONG_CONTROL = 1
+  MISSING_DAS_SETTINGS = 4
+  PASSIVE_ONLY = 8
+
+  # deprecated flags
+  # old 2-bit FW is now dashcammed
+  DAS_STEERING_3_BIT_DEPRECATED = 2
+
+
 class CAR(Platforms):
   TESLA_MODEL_3 = TeslaPlatformConfig(
     [
@@ -59,6 +69,11 @@ class CAR(Platforms):
     CarSpecs(wheelbase=2.890, steerRatio=12.0),
     {Bus.party: 'tesla_model3_party', Bus.radar: 'tesla_radar_continental_generated'},
   )
+  TESLA_MODEL_Y_HW45 = TeslaPlatformConfig(
+    [],
+    TESLA_MODEL_Y.specs,
+    flags=TeslaFlags.PASSIVE_ONLY,
+  )
   TESLA_MODEL_X = TeslaPlatformConfig(
     [TeslaCarDocsHW4("Tesla Model X (with HW4) 2024")],
     CarSpecs(wheelbase=2.960, steerRatio=12.0),
@@ -66,7 +81,7 @@ class CAR(Platforms):
 
 
 FW_QUERY_CONFIG = FwQueryConfig(
-  fw_version_regex=br".+,[EYX]\d?[A-Z]*\d{3}\.\d+(?:\.\d+)?",
+  fw_version_regex=br".+,(?:[EYX]\d?[A-Z]*\d{3}|DL005)\.\d+(?:\.\d+)?",
   requests=[
     Request(
       [StdQueries.TESTER_PRESENT_REQUEST, StdQueries.SUPPLIER_SOFTWARE_VERSION_REQUEST],
@@ -112,15 +127,6 @@ class TeslaSafetyFlags(IntFlag):
   LONG_CONTROL = 1
 
   # deprecated flags
-  DAS_STEERING_3_BIT_DEPRECATED = 2
-
-
-class TeslaFlags(IntFlag):
-  LONG_CONTROL = 1
-  MISSING_DAS_SETTINGS = 4
-
-  # deprecated flags
-  # old 2-bit FW is now dashcammed
   DAS_STEERING_3_BIT_DEPRECATED = 2
 
 

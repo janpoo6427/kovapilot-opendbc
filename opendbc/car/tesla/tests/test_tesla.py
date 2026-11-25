@@ -2,11 +2,12 @@ import re
 import unittest
 
 from opendbc.car import gen_empty_fingerprint
+from opendbc.car.fw_versions import match_fw_to_car
 from opendbc.car.structs import CarParams
 from opendbc.car.tesla.interface import CarInterface
 from opendbc.car.tesla.fingerprints import FW_VERSIONS
 from opendbc.car.tesla.radar_interface import RADAR_START_ADDR
-from opendbc.car.tesla.values import CAR
+from opendbc.car.tesla.values import CANBUS, CAR
 
 Ecu = CarParams.Ecu
 
@@ -50,13 +51,40 @@ PLATFORM_TO_CAR = {
 
 class TestTeslaFingerprint(unittest.TestCase):
   def test_fw_platform_code(self):
-    # Every EPS FW must parse and its platform letter must match the car it's filed under.
+    # Verify the platform letter for the established EPS firmware families.
     for car_model, ecus in FW_VERSIONS.items():
+      if car_model == CAR.TESLA_MODEL_Y_HW45:
+        continue
       for fw in ecus.get((Ecu.eps, 0x730, None), []):
         m = FW_RE.match(fw)
 
         assert m is not None, f"Unparsable FW: {fw}"
         assert PLATFORM_TO_CAR[m['platform']] == car_model, f"Platform letter {m['platform']!r} != {car_model.value}: {fw}"
+
+  def test_hw45_is_identified_without_enabling_control(self):
+    fingerprint = gen_empty_fingerprint()
+    fingerprint[CANBUS.autopilot_party][0x489] = 8
+    firmware_matches = (
+      (b'TeMYG4_Main_0.0.0 (87),DL005.08.3', {CAR.TESLA_MODEL_Y_HW45}),
+      (b'TeMYG4_Main_0.0.0 (92),Y4OC003.11.2', {CAR.TESLA_MODEL_Y_HW45}),
+      (b'TeMYG4_Main_0.0.0 (92),Y4003.10.2', {CAR.TESLA_MODEL_Y}),
+      (b'TeMYG4_Main_0.0.0 (92),Y4OC003.11.3', set()),
+    )
+    for version, expected in firmware_matches:
+      with self.subTest(version=version):
+        fw = [CarParams.CarFw(ecu=Ecu.eps, address=0x730, brand="tesla", fwVersion=version)]
+        exact, matches = match_fw_to_car(fw, "", log=False)
+        assert exact and matches == expected
+
+    CP = CarInterface.get_params(CAR.TESLA_MODEL_Y_HW45, fingerprint, [], True, False, False)
+    assert CP.dashcamOnly
+    assert CP.radarUnavailable
+    assert not CP.alphaLongitudinalAvailable
+    assert not CP.openpilotLongitudinalControl
+    assert [config.safetyModel for config in CP.safetyConfigs] == [CarParams.SafetyModel.noOutput]
+    stock_CP = CarInterface.get_params(CAR.TESLA_MODEL_Y, fingerprint, [], False, False, False)
+    assert not stock_CP.dashcamOnly
+    assert [config.safetyModel for config in stock_CP.safetyConfigs] == [CarParams.SafetyModel.tesla]
 
   def test_radar_detection(self):
     # Test radar availability detection for cars with radar DBC defined

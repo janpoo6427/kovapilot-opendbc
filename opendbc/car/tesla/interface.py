@@ -14,14 +14,20 @@ class CarInterface(CarInterfaceBase):
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
     ret.brand = "tesla"
+    ret.steerControlType = structs.CarParams.SteerControlType.angle
+
+    if ret.flags & TeslaFlags.PASSIVE_ONLY:
+      # Identify the vehicle while its CAN layout and control paths are being validated.
+      ret.dashcamOnly = True
+      ret.radarUnavailable = True
+      ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]
+      return ret
 
     ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.tesla)]
 
     ret.steerLimitTimer = 0.4
     ret.steerActuatorDelay = 0.1
     ret.steerAtStandstill = True
-
-    ret.steerControlType = structs.CarParams.SteerControlType.angle
 
     # Model X and HW 2.5 vehicles are missing DAS_settings
     if 0x293 not in fingerprint[CANBUS.autopilot_party]:
