@@ -1,5 +1,6 @@
 import unittest
 import copy
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -442,17 +443,47 @@ class TestHyundaiFingerprint(unittest.TestCase):
       assert not wrong_fw_CP.openpilotLongitudinalControl
       assert not wrong_fw_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
 
+  def _verified_longitudinal_profile(self):
+    platform = CAR.HYUNDAI_IONIQ_9
+    profile = replace(platform.config.longitudinal_config, stock_aeb_fcw_status=HyundaiCanFDStockSafetyStatus.PRESERVED)
+    return patch.object(platform, "config", replace(platform.config, longitudinal_config=profile))
+
+  def test_unverified_longitudinal_profile_stays_unavailable(self):
+    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
+      CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, False, False)
+    assert CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE
+    assert not CP.alphaLongitudinalAvailable
+    assert not CP.openpilotLongitudinalControl
+    assert CP.pcmCruise
+    assert not CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+
   def test_longitudinal_staging_requires_source_gate_and_exact_capability(self):
     fingerprint = self._ioniq9_fingerprint()
     car_fw = self._ioniq9_fw()
 
-    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
+    with self._verified_longitudinal_profile():
+      default_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
+      assert not default_CP.alphaLongitudinalAvailable
+      assert not default_CP.openpilotLongitudinalControl
+
+    with self._verified_longitudinal_profile(), patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
+      off_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, False, False, False)
+      assert off_CP.alphaLongitudinalAvailable
+      assert not off_CP.openpilotLongitudinalControl
+      assert off_CP.pcmCruise
+      assert not off_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+
       CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
       assert CP.alphaLongitudinalAvailable
       assert CP.openpilotLongitudinalControl
       assert not CP.pcmCruise
       assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
       assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CANFD_ANGLE_STEERING
+
+      release_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, True, False)
+      assert not release_CP.alphaLongitudinalAvailable
+      assert not release_CP.openpilotLongitudinalControl
+      assert release_CP.dashcamOnly
 
       # The source gate alone cannot authorize a missing passive capability.
       missing = copy.deepcopy(fingerprint)
@@ -463,8 +494,18 @@ class TestHyundaiFingerprint(unittest.TestCase):
       assert missing_CP.pcmCruise
       assert not missing_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
 
+  def test_longitudinal_profile_preserves_stock_ecu_during_init_and_deinit(self):
+    with self._verified_longitudinal_profile(), patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
+      CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, False, False)
+      assert CP.openpilotLongitudinalControl
+      CP.flags &= ~int(HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC)
+      with patch("opendbc.car.hyundai.interface.disable_ecu") as disable_ecu:
+        CarInterface.init(CP, None, None)
+        CarInterface.deinit(CP, None, None)
+      disable_ecu.assert_not_called()
+
   def test_longitudinal_staging_output_topology(self):
-    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
+    with self._verified_longitudinal_profile(), patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
       CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, False, False)
 
     controller = CarController(DBC[CP.carFingerprint], CP)

@@ -2,7 +2,8 @@ from typing import cast
 
 from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import HyundaiCanFDPlatformConfig, HyundaiCanFDSteeringApi, HyundaiFlags, CAR, DBC, HyundaiSafetyFlags
+from opendbc.car.hyundai.values import (CAR, DBC, HyundaiCanFDEcuDisableStrategy, HyundaiCanFDPlatformConfig,
+                                       HyundaiCanFDSteeringApi, HyundaiCanFDStockSafetyStatus, HyundaiFlags, HyundaiSafetyFlags)
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
@@ -190,23 +191,27 @@ class CarInterface(CarInterfaceBase):
       ret.dashcamOnly = True
 
     if ret.flags & HyundaiFlags.CANFD:
-      steering_config = cast(HyundaiCanFDPlatformConfig, platform.config).steering_config
+      canfd_config = cast(HyundaiCanFDPlatformConfig, platform.config)
       # Angle-command CAN-FD profiles require the exact firmware and passive
       # topology checks above. Longitudinal is additionally guarded by a
       # source-level developer gate while stock AEB/FCW behavior is validated.
-      if steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
-        longitudinal_staging_enabled = (ENABLE_CANFD_LONGITUDINAL_STAGING and alpha_long and
-                                         bool(ret.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE))
-        ret.alphaLongitudinalAvailable = longitudinal_staging_enabled
-        ret.openpilotLongitudinalControl = longitudinal_staging_enabled
-        ret.pcmCruise = not longitudinal_staging_enabled
-        if longitudinal_staging_enabled:
+      if canfd_config.steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
+        lateral_staging_enabled = (ENABLE_CANFD_LATERAL_STAGING and not is_release and
+                                   bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING))
+        longitudinal_config = canfd_config.longitudinal_config
+        ret.alphaLongitudinalAvailable = (
+          ENABLE_CANFD_LONGITUDINAL_STAGING and lateral_staging_enabled and not ret.dashcamOnly and
+          bool(ret.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE) and
+          longitudinal_config.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE and
+          longitudinal_config.stock_aeb_fcw_status is HyundaiCanFDStockSafetyStatus.PRESERVED
+        )
+        ret.openpilotLongitudinalControl = ret.alphaLongitudinalAvailable and alpha_long
+        ret.pcmCruise = not ret.openpilotLongitudinalControl
+        if ret.openpilotLongitudinalControl:
           ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.LONG.value
         else:
           ret.safetyConfigs[-1].safetyParam &= ~HyundaiSafetyFlags.LONG.value
 
-        lateral_staging_enabled = (ENABLE_CANFD_LATERAL_STAGING and not is_release and
-                                   bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING))
         if not lateral_staging_enabled:
           ret.dashcamOnly = True
           ret.safetyConfigs = [get_safety_config(structs.CarParams.SafetyModel.noOutput)]
@@ -219,7 +224,11 @@ class CarInterface(CarInterfaceBase):
     if communication_control is None:
       communication_control = bytes([uds.SERVICE_TYPE.COMMUNICATION_CONTROL, 0x80 | uds.CONTROL_TYPE.DISABLE_RX_DISABLE_TX, uds.MESSAGE_TYPE.NORMAL])
 
-    if CP.openpilotLongitudinalControl and not (CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC)):
+    keep_stock_scc_ecu = bool(CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC))
+    if CP.openpilotLongitudinalControl and CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE:
+      config = cast(HyundaiCanFDPlatformConfig, CAR(CP.carFingerprint).config).longitudinal_config
+      keep_stock_scc_ecu |= config.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE
+    if CP.openpilotLongitudinalControl and not keep_stock_scc_ecu:
       addr, bus = 0x7d0, CanBus(CP).ECAN if CP.flags & HyundaiFlags.CANFD else 0
       if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG.value:
         addr, bus = 0x730, CanBus(CP).ECAN
