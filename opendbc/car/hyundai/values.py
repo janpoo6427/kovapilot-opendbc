@@ -513,8 +513,11 @@ class CAR(Platforms):
       command_address=0x1A0,
       command_dlc=32,
       command_frequency_hz=50,
-      # The known-good route does not disable 0x730 or 0x7D0. Activation stays
-      # prohibited until stock AEB/FCW preservation is independently proven.
+      # The known-good route does not disable 0x730 or 0x7D0 (same as carrot's
+      # camera-SCC mode): only SCC_CONTROL is replaced, so the stock camera/ADAS
+      # ECUs keep running. Whether stock AEB/FCW still act while openpilot owns
+      # longitudinal has NOT been verified on the car, so the status stays
+      # UNVERIFIED. It no longer blocks the opt-in alpha longitudinal choice.
       ecu_disable_strategy=HyundaiCanFDEcuDisableStrategy.NONE,
       stock_aeb_fcw_status=HyundaiCanFDStockSafetyStatus.UNVERIFIED,
       required_messages=(

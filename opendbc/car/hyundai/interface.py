@@ -3,7 +3,7 @@ from typing import cast
 from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import (CAR, DBC, HyundaiCanFDEcuDisableStrategy, HyundaiCanFDPlatformConfig,
-                                       HyundaiCanFDSteeringApi, HyundaiCanFDStockSafetyStatus, HyundaiFlags, HyundaiSafetyFlags)
+                                       HyundaiCanFDSteeringApi, HyundaiFlags, HyundaiSafetyFlags)
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
@@ -21,8 +21,10 @@ ENABLE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.can
 # longitudinal control. These deliberately are not Params: changing either
 # requires review and a new build. Exact passive topology and firmware matching
 # are still required below, and release builds remain fail-closed for lateral.
+# Longitudinal is only offered (alphaLongitudinalAvailable); it stays inactive
+# until the user enables the existing alpha longitudinal preference.
 ENABLE_CANFD_LATERAL_STAGING = True
-ENABLE_CANFD_LONGITUDINAL_STAGING = False
+ENABLE_CANFD_LONGITUDINAL_STAGING = True
 
 
 class CarInterface(CarInterfaceBase):
@@ -193,8 +195,11 @@ class CarInterface(CarInterfaceBase):
     if ret.flags & HyundaiFlags.CANFD:
       canfd_config = cast(HyundaiCanFDPlatformConfig, platform.config)
       # Angle-command CAN-FD profiles require the exact firmware and passive
-      # topology checks above. Longitudinal is additionally guarded by a
-      # source-level developer gate while stock AEB/FCW behavior is validated.
+      # topology checks above. Longitudinal additionally needs the source-level
+      # gate and a profile that keeps the stock SCC/ADAS ECUs running (no ECU
+      # disable), as carrot's camera-SCC mode does. Stock AEB/FCW preservation
+      # is NOT verified on the car (stock_aeb_fcw_status stays UNVERIFIED); it
+      # is no longer an availability gate, and the user must still opt in.
       if canfd_config.steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
         lateral_staging_enabled = (ENABLE_CANFD_LATERAL_STAGING and not is_release and
                                    bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING))
@@ -202,8 +207,7 @@ class CarInterface(CarInterfaceBase):
         ret.alphaLongitudinalAvailable = (
           ENABLE_CANFD_LONGITUDINAL_STAGING and lateral_staging_enabled and not ret.dashcamOnly and
           bool(ret.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE) and
-          longitudinal_config.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE and
-          longitudinal_config.stock_aeb_fcw_status is HyundaiCanFDStockSafetyStatus.PRESERVED
+          longitudinal_config.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE
         )
         ret.openpilotLongitudinalControl = ret.alphaLongitudinalAvailable and alpha_long
         ret.pcmCruise = not ret.openpilotLongitudinalControl

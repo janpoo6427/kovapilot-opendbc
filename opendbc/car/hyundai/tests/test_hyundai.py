@@ -291,18 +291,21 @@ class TestHyundaiFingerprint(unittest.TestCase):
     stock_bus = getattr(CAN, steering_config.stock_bus.value)
     car_fw = self._ioniq9_fw()
 
-    # Fingerprinting supplies a string in production. Experimental longitudinal
-    # must not weaken the lateral-only safety boundary.
+    # Fingerprinting supplies a string in production. Without the user's alpha
+    # longitudinal preference the car stays lateral-only (stock ACC owns speed).
     CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, False, False, False)
     assert CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
     assert not CP.dashcamOnly
     assert CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.hyundaiCanfd
     assert CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.CANFD_ANGLE_STEERING
     assert not CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.LONG
-    assert not CP.alphaLongitudinalAvailable
+    # Longitudinal is offered (2026-11-27 unlock) but not active without opt-in.
+    assert CP.alphaLongitudinalAvailable
     assert not CP.openpilotLongitudinalControl
     assert CP.pcmCruise
 
+    # With the opt-in, the exact capability enables openpilot longitudinal
+    # (2026-11-27 unlock; previously this asserted it stayed unavailable).
     CP = CarInterface.get_params(str(CAR.HYUNDAI_IONIQ_9), fingerprint, car_fw, True, False, False)
     assert steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
     assert CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING
@@ -311,10 +314,10 @@ class TestHyundaiFingerprint(unittest.TestCase):
     assert not CP.dashcamOnly
     assert CP.safetyConfigs[0].safetyModel == CarParams.SafetyModel.hyundaiCanfd
     assert CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.CANFD_ANGLE_STEERING
-    assert not CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.LONG
-    assert not CP.alphaLongitudinalAvailable
-    assert not CP.openpilotLongitudinalControl
-    assert CP.pcmCruise
+    assert CP.safetyConfigs[0].safetyParam & HyundaiSafetyFlags.LONG
+    assert CP.alphaLongitudinalAvailable
+    assert CP.openpilotLongitudinalControl
+    assert not CP.pcmCruise
 
     # Source gate and release builds remain fail-closed even with exact evidence.
     with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LATERAL_STAGING", False):
@@ -413,9 +416,10 @@ class TestHyundaiFingerprint(unittest.TestCase):
     CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
     assert CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE
     assert CP.flags & HyundaiFlags.CANFD_CAMERA_SCC
-    assert not CP.alphaLongitudinalAvailable
-    assert not CP.openpilotLongitudinalControl
-    assert not CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+    # 2026-11-27 unlock: the exact candidate is now available and opt-in active.
+    assert CP.alphaLongitudinalAvailable
+    assert CP.openpilotLongitudinalControl
+    assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
 
     # 0x12A is specific to the observed ADAS-harness topology. Losing it must
     # block the longitudinal candidate without weakening the angle capability.
@@ -448,20 +452,85 @@ class TestHyundaiFingerprint(unittest.TestCase):
     profile = replace(platform.config.longitudinal_config, stock_aeb_fcw_status=HyundaiCanFDStockSafetyStatus.PRESERVED)
     return patch.object(platform, "config", replace(platform.config, longitudinal_config=profile))
 
-  def test_unverified_longitudinal_profile_stays_unavailable(self):
-    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", True):
-      CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, False, False)
-    assert CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE
-    assert not CP.alphaLongitudinalAvailable
-    assert not CP.openpilotLongitudinalControl
-    assert CP.pcmCruise
-    assert not CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+  def test_unverified_stock_aeb_profile_is_opt_in_only(self):
+    # 2026-11-27: replaces test_unverified_longitudinal_profile_stays_unavailable.
+    # Stock AEB/FCW preservation is still unverified and recorded as such, but it
+    # no longer blocks the user's explicit alpha longitudinal choice.
+    config = CAR.HYUNDAI_IONIQ_9.config.longitudinal_config
+    assert config.stock_aeb_fcw_status == HyundaiCanFDStockSafetyStatus.UNVERIFIED
+    fingerprint = self._ioniq9_fingerprint()
+    car_fw = self._ioniq9_fw()
+
+    off_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, False, False, False)
+    assert off_CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE
+    assert off_CP.alphaLongitudinalAvailable
+    assert not off_CP.openpilotLongitudinalControl
+    assert off_CP.pcmCruise
+    assert not off_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+
+    CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
+    assert CP.alphaLongitudinalAvailable
+    assert CP.openpilotLongitudinalControl
+    assert not CP.pcmCruise
+    assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+
+    # The source gate still closes it again.
+    with patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", False):
+      gated_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
+    assert not gated_CP.alphaLongitudinalAvailable
+    assert not gated_CP.openpilotLongitudinalControl
+    assert gated_CP.pcmCruise
+    assert not gated_CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.LONG
+
+    # A profile that would disable a stock ECU is never offered by this path.
+    platform = CAR.HYUNDAI_IONIQ_9
+    disabling = replace(platform.config.longitudinal_config, ecu_disable_strategy=HyundaiCanFDEcuDisableStrategy.ADAS)
+    with patch.object(platform, "config", replace(platform.config, longitudinal_config=disabling)):
+      disabling_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
+    assert not disabling_CP.alphaLongitudinalAvailable
+    assert not disabling_CP.openpilotLongitudinalControl
+
+  def test_unlocked_longitudinal_keeps_stock_ecus_and_sends_scc_control(self):
+    # Default (unpatched) profile: opt-in longitudinal never disables the stock
+    # ADAS/radar ECUs and only replaces SCC_CONTROL on ECAN.
+    CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, False, False)
+    assert CP.openpilotLongitudinalControl
+    assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CAMERA_SCC
+    assert CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.CANFD_ANGLE_STEERING
+    with patch("opendbc.car.hyundai.interface.disable_ecu") as disable_ecu:
+      CarInterface.init(CP, None, None)
+      CarInterface.deinit(CP, None, None)
+    disable_ecu.assert_not_called()
+
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    CS = SimpleNamespace(
+      out=SimpleNamespace(steeringPressed=False, steeringAngleDeg=0.0),
+      lfa_alt={},
+      mdps={"COUNTER": 0, "MDPS_ADASAciActvSta_Lv2": 1, "MDPS_ADAS_AciFltSig_Lv2": 0},
+      cruise_info={"COUNTER": 0x20},
+    )
+    hud_control = SimpleNamespace(leadDistanceBars=2)
+    CC = SimpleNamespace(enabled=True, latActive=True, cruiseControl=SimpleNamespace(override=False))
+    controller.frame = 0
+    msgs = controller.create_canfd_msgs(True, 0, 80, 0.1, False, hud_control, CS, CC)
+    self.assertEqual([(address, bus, len(dat)) for address, dat, bus in msgs],
+                     [(0xCB, controller.CAN.ECAN, 24), (0xEA, controller.CAN.CAM, 24),
+                      (0x1A0, controller.CAN.ECAN, 32)])
+    # No tester-present / ECU-disable keepalive is sent either.
+    assert all(address not in (0x730, 0x7D0) for address, _, _ in msgs)
+
+    # Release builds stay fail-closed.
+    release_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, self._ioniq9_fingerprint(), self._ioniq9_fw(), True, True, False)
+    assert not release_CP.alphaLongitudinalAvailable
+    assert not release_CP.openpilotLongitudinalControl
 
   def test_longitudinal_staging_requires_source_gate_and_exact_capability(self):
     fingerprint = self._ioniq9_fingerprint()
     car_fw = self._ioniq9_fw()
 
-    with self._verified_longitudinal_profile():
+    # 2026-11-27: the source gate now defaults to on, so the closed case is
+    # exercised by patching it off instead of relying on the default.
+    with self._verified_longitudinal_profile(), patch("opendbc.car.hyundai.interface.ENABLE_CANFD_LONGITUDINAL_STAGING", False):
       default_CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, True, False, False)
       assert not default_CP.alphaLongitudinalAvailable
       assert not default_CP.openpilotLongitudinalControl
