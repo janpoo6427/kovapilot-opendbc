@@ -70,6 +70,14 @@ bool get_controls_allowed(void){
   return safety.controls_allowed;
 }
 
+void set_lateral_engaged(bool c){
+  SAFETY_SET(lateral_engaged, c);
+}
+
+bool get_lateral_engaged(void){
+  return safety.lateral_engaged;
+}
+
 bool get_ignition_can(void){
   return ignition_can;
 }

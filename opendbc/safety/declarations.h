@@ -253,6 +253,10 @@ void safety_heartbeat(bool engaged);
 void safety_heartbeat_check(void);
 void safety_alternative_experience(int alt_exp);
 
+// Always-on lateral: once the driver engages, lateral control may outlive cruise.
+// It is still blocked while braking, at standstill, and on RX faults (see lateral_controls_allowed).
+#define ALT_EXP_ALWAYS_ON_LATERAL 1024U
+
 typedef enum {
   CHRYSLER_RAM_DT,
   CHRYSLER_RAM_HD,
@@ -295,6 +299,7 @@ typedef struct {
   bool acc_main_on; // referred to as "ACC off" in ISO 15622:2018
   uint8_t cruise_button_prev;
   bool safety_rx_checks_invalid;
+  bool lateral_engaged;  // driver engaged always-on lateral since the safety mode was set
 
   // for safety modes with torque steering control
   int desired_torque_last;       // last desired steer torque
@@ -339,6 +344,7 @@ typedef struct {
   bool hyundai_angle_stock_mdps_prev_valid;
   uint8_t hyundai_angle_mdps_tx_counter;
   bool hyundai_angle_mdps_tx_counter_valid;
+  bool hyundai_angle_mdps_fault;  // last MDPS frame had an invalid angle or an MDPS fault
   bool tesla_stock_aeb;
   // Only rising edges while controls are not allowed are considered for these systems:
   // TODO: Only LKAS (non-emergency) is currently supported since we've only seen it

@@ -178,6 +178,7 @@ static bool rx_msg_safety_check(const CANPacket_t *msg,
   bool valid = is_msg_valid(index);
   if (!valid) {
     safety.controls_allowed = false;
+    safety.lateral_engaged = false;
   }
   return valid;
 }
@@ -208,6 +209,8 @@ static bool rx_hook_copy(const CANPacket_t *msg) {
   // reset mismatches on rising edge of controls_allowed to avoid rare race condition
   if (safety.controls_allowed && !controls_allowed_prev) {
     safety.heartbeat_engaged_mismatches = 0;
+    // a driver engagement also engages always-on lateral, which then outlives cruise
+    safety.lateral_engaged = always_on_lateral_enabled();
   }
 
   return valid;
@@ -287,6 +290,7 @@ static void tick_copy(void) {
     if (status->lagging || !is_msg_valid(i)) {
       rx_checks_invalid = true;
       safety.controls_allowed = false;
+      safety.lateral_engaged = false;
     }
   }
 

@@ -113,6 +113,7 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
       } else {
         safety.controls_allowed = false;
       }
+      safety.hyundai_angle_mdps_fault = !valid_angle || mdps_fault;
     }
   }
 
@@ -120,15 +121,23 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   const unsigned int button_addr = safety_setup.hyundai_canfd_alt_buttons ? 0x1aaU : 0x1cfU;
   if (msg_matches(msg, button_addr, pt_bus)) {
     bool main_button = false;
+    bool lfa_button = false;
     uint8_t cruise_button = 0U;
     if (msg_matches(msg, 0x1cfU, pt_bus)) {
       cruise_button = msg->data[2] & 0x7U;
       main_button = GET_BIT(msg, 19U);
+      lfa_button = GET_BIT(msg, 23U);
     } else {
       cruise_button = (msg->data[4] >> 4) & 0x7U;
       main_button = GET_BIT(msg, 34U);
+      lfa_button = GET_BIT(msg, 39U);
     }
     hyundai_common_cruise_buttons_check(cruise_button, main_button);
+
+    // the LFA button is a driver engagement for always-on lateral
+    if (lfa_button && always_on_lateral_enabled()) {
+      safety.lateral_engaged = true;
+    }
   }
 
   // gas press, different for EV, hybrid, and ICE models
@@ -225,6 +234,8 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
                                          (safety.angle_meas.min <= -600) || (safety.angle_meas.max >= 600));
     const bool driver_override = steer_control_enabled &&
                                  ((safety.torque_driver.min < -250) || (safety.torque_driver.max > 250));
+    // without controls_allowed (always-on lateral), an MDPS fault blocks active control until it clears
+    const bool lateral_mdps_fault = steer_control_enabled && !safety.controls_allowed && safety.hyundai_angle_mdps_fault;
     const bool angle_violation = steer_angle_cmd_checks(desired_angle, steer_control_enabled, HYUNDAI_CANFD_ANGLE_LIMITS) ||
                                  safety_max_limit_check(desired_angle, HYUNDAI_CANFD_ANGLE_LIMITS.max_angle,
                                                        -HYUNDAI_CANFD_ANGLE_LIMITS.max_angle);
@@ -234,7 +245,7 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
     const bool checksum_violation = hyundai_canfd_get_checksum(msg) != hyundai_common_canfd_compute_checksum(msg);
     const bool counter_violation = safety.hyundai_angle_tx_counter_valid &&
                                    (counter != ((safety.hyundai_angle_tx_counter + 1U) & 0xFFU));
-    if (state_violation || active_angle_violation || driver_override || angle_violation || measured_error ||
+    if (state_violation || active_angle_violation || driver_override || lateral_mdps_fault || angle_violation || measured_error ||
         frequency_violation || checksum_violation || counter_violation || !stock_payload_matches) {
       tx = false;
       // Protocol, measurement, and frequency failures happen outside the

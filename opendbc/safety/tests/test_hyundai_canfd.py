@@ -5,7 +5,7 @@ import unittest
 from opendbc.car.hyundai.values import HyundaiSafetyFlags
 from opendbc.car.structs import CarParams
 import opendbc.safety.tests.common as common
-from opendbc.safety.tests.hyundai_common import HyundaiButtonBase, HyundaiLongitudinalBase
+from opendbc.safety.tests.hyundai_common import HyundaiAlwaysOnLateralBase, HyundaiButtonBase, HyundaiLongitudinalBase
 from opendbc.safety.tests.libsafety import libsafety_py
 
 # All combinations of radar/camera-SCC and gas/hybrid/EV cars
@@ -21,7 +21,8 @@ ALL_GAS_EV_HYBRID_COMBOS = [
 ]
 
 
-class TestHyundaiCanfdBase(HyundaiButtonBase, common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest, common.SteerRequestCutSafetyTest):
+class TestHyundaiCanfdBase(HyundaiButtonBase, HyundaiAlwaysOnLateralBase, common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest,
+                           common.SteerRequestCutSafetyTest):
 
   DBC = "hyundai_canfd_generated"
   SAFETY_MODEL = CarParams.SafetyModel.hyundaiCanfd
@@ -49,6 +50,14 @@ class TestHyundaiCanfdBase(HyundaiButtonBase, common.CarSafetyTest, common.Drive
   STEER_MSG = ""
   GAS_MSG = ("", "")
   BUTTONS_TX_BUS = 1
+  LFA_BUTTON = True
+
+  def _lateral_cmd_allowed(self):
+    self._set_prev_torque(0)
+    return self._tx(self._torque_cmd_msg(self.MAX_RATE_UP))
+
+  def _stale_counter_msg(self):
+    return self.packer.make_can_msg_safety("WHEEL_SPEEDS", self.PT_BUS, {"COUNTER": 0})
 
   def _torque_driver_msg(self, torque):
     values = {"MDPS_StrTqSnsrVal": torque}
@@ -74,12 +83,13 @@ class TestHyundaiCanfdBase(HyundaiButtonBase, common.CarSafetyTest, common.Drive
     values = {"ACCMode": 1 if enable else 0}
     return self.packer.make_can_msg_safety("SCC_CONTROL", self.SCC_BUS, values)
 
-  def _button_msg(self, buttons, main_button=0, bus=None):
+  def _button_msg(self, buttons, main_button=0, bus=None, lfa_button=0):
     if bus is None:
       bus = self.PT_BUS
     values = {
       "CRUISE_BUTTONS": buttons,
       "ADAPTIVE_CRUISE_MAIN_BTN": main_button,
+      "LDA_BTN": lfa_button,
     }
     return self.packer.make_can_msg_safety("CRUISE_BUTTONS", bus, values)
 
@@ -139,10 +149,11 @@ class TestHyundaiCanfdLFASteeringAltButtonsBase(TestHyundaiCanfdLFASteeringBase)
   def SAFETY_PARAM(self):
     return HyundaiSafetyFlags.CANFD_ALT_BUTTONS | self.EXTRA_SAFETY_PARAM
 
-  def _button_msg(self, buttons, main_button=0, bus=1):
+  def _button_msg(self, buttons, main_button=0, bus=1, lfa_button=0):
     values = {
       "CRUISE_BUTTONS": buttons,
       "ADAPTIVE_CRUISE_MAIN_BTN": main_button,
+      "LDA_BTN": lfa_button,
     }
     return self.packer.make_can_msg_safety("CRUISE_BUTTONS_ALT", self.PT_BUS, values)
 
@@ -233,7 +244,7 @@ class TestHyundaiCanfdLKASteeringLongEV(HyundaiLongitudinalBase, TestHyundaiCanf
     self.assertFalse(self._tx(self._accel_msg(5.0, accel_value=0)))
 
 
-class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafetyTest, common.CarSafetyTest):
+class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBase, common.AngleSteeringSafetyTest, common.CarSafetyTest):
 
   DBC = "hyundai_canfd_generated"
   SAFETY_MODEL = CarParams.SafetyModel.hyundaiCanfd
@@ -247,6 +258,7 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
   SCC_BUS = 2
   BUTTONS_TX_BUS = 2
   STANDSTILL_THRESHOLD = 12
+  LFA_BUTTON = True
 
   STEER_ANGLE_MAX = 175.0
   STEER_ANGLE_TEST_MAX = 55.0
@@ -338,11 +350,54 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
     return self.packer.make_can_msg_safety("SCC_CONTROL", self.SCC_BUS,
                                            {"ACCMode": 1 if enable else 0})
 
-  def _button_msg(self, buttons, main_button=0, bus=None):
+  def _button_msg(self, buttons, main_button=0, bus=None, lfa_button=0):
     return self.packer.make_can_msg_safety("CRUISE_BUTTONS", self.PT_BUS, {
       "CRUISE_BUTTONS": buttons,
       "ADAPTIVE_CRUISE_MAIN_BTN": main_button,
+      "LDA_BTN": lfa_button,
     })
+
+  def _moving_msg(self, moving):
+    return self._vehicle_moving_msg(self.STANDSTILL_THRESHOLD + 1 if moving else 0)
+
+  def _stale_counter_msg(self):
+    return self.packer.make_can_msg_safety("WHEEL_SPEEDS", self.PT_BUS, {"COUNTER": 0})
+
+  def _after_safety_reset(self):
+    self._rx(self._stock_angle_msg())
+    self._rx(self.packer.make_can_msg_safety("MDPS", self.PT_BUS, self.stock_mdps))
+
+  def _lateral_cmd_allowed(self):
+    self._reset_angle_measurement(0)
+    self._set_prev_desired_angle(0)
+    return self._tx(self._angle_cmd_msg(0, True))
+
+  def test_always_on_lateral_mdps_fault(self):
+    self._always_on()
+    self._engage_without_cruise()
+    self.assertTrue(self._lateral_cmd_allowed())
+    # an MDPS fault blocks active control without cruise, inactive frames still pass
+    self._rx(self._angle_meas_msg(0, MDPS_LkaFailSta=1))
+    self.assertTrue(self.safety.get_lateral_engaged())
+    self._set_prev_desired_angle(0)
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, False)))
+    # an invalid angle too
+    self._rx(self._angle_meas_msg(0x7FFF / 10.0))
+    self._set_prev_desired_angle(0)
+    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
+    # the fault clears with the next good frame
+    self.assertTrue(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_mdps_fault_with_controls_allowed(self):
+    # with controls_allowed the stock behavior is unchanged: the fault drops controls_allowed
+    self._always_on()
+    self._cruise_engage()
+    self._rx(self._angle_meas_msg(0, MDPS_LkaFailSta=1))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(0)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
 
   def test_button_sends(self):
     for controls_allowed in (False, True):

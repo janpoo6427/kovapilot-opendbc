@@ -5,7 +5,7 @@ import unittest
 from opendbc.car.hyundai.values import HyundaiSafetyFlags
 from opendbc.car.structs import CarParams
 import opendbc.safety.tests.common as common
-from opendbc.safety.tests.hyundai_common import HyundaiButtonBase, HyundaiLongitudinalBase
+from opendbc.safety.tests.hyundai_common import HyundaiAlwaysOnLateralBase, HyundaiButtonBase, HyundaiLongitudinalBase
 
 
 # 4 bit checkusm used in some hyundai messages
@@ -43,7 +43,8 @@ def checksum(msg):
   return addr, ret, bus
 
 
-class TestHyundaiSafety(HyundaiButtonBase, common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest, common.SteerRequestCutSafetyTest):
+class TestHyundaiSafety(HyundaiButtonBase, HyundaiAlwaysOnLateralBase, common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest,
+                       common.SteerRequestCutSafetyTest):
   DBC = "hyundai_can_generated"
   SAFETY_MODEL = CarParams.SafetyModel.hyundai
 
@@ -73,6 +74,13 @@ class TestHyundaiSafety(HyundaiButtonBase, common.CarSafetyTest, common.DriverTo
     values = {"CF_Clu_CruiseSwState": buttons, "CF_Clu_CruiseSwMain": main_button, "CF_Clu_AliveCnt1": self.cnt_button}
     self.__class__.cnt_button += 1
     return self.packer.make_can_msg_safety("CLU11", bus, values)
+
+  def _stale_counter_msg(self):
+    return self.packer.make_can_msg_safety("CLU11", 0, {"CF_Clu_AliveCnt1": 0})
+
+  def _lateral_cmd_allowed(self):
+    self._set_prev_torque(0)
+    return self._tx(self._torque_cmd_msg(self.MAX_RATE_UP))
 
   def _user_gas_msg(self, gas):
     values = {"CF_Ems_AclAct": gas, "AliveCounter": self.cnt_gas % 4}

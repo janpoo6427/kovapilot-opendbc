@@ -1,5 +1,6 @@
 from collections.abc import Callable
 
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.libsafety import libsafety_py
 from opendbc.safety.tests.common import make_msg
@@ -77,6 +78,131 @@ class HyundaiButtonBase(common.CarSafetyTest):
       self._rx(self._button_msg(Buttons.NONE))
 
 
+class HyundaiAlwaysOnLateralBase(common.CarSafetyTest):
+  """
+    ALT_EXP_ALWAYS_ON_LATERAL: after a driver engagement (cruise, or the LFA button where the
+    safety mode reads it), lateral commands stay allowed without cruise while the car moves,
+    the brake is released and the RX checks are valid.
+  """
+  LFA_BUTTON = False  # the safety mode reads the LFA button as an engagement
+
+  _button_msg: Callable[..., libsafety_py.CANPacket]
+
+  def _lateral_cmd_allowed(self) -> bool:
+    raise NotImplementedError
+
+  def _stale_counter_msg(self):
+    return self._button_msg(Buttons.NONE)
+
+  def _moving_msg(self, moving):
+    return self._speed_msg(self.STANDSTILL_THRESHOLD + 1 if moving else 0)
+
+  def _cruise_engage(self):
+    self._rx(self._button_msg(Buttons.SET))
+    self._rx(self._pcm_status_msg(True))
+
+  def _cruise_disengage(self):
+    self._rx(self._pcm_status_msg(False))
+
+  def _always_on(self, enabled=True):
+    self.safety.set_alternative_experience(ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL if enabled else ALTERNATIVE_EXPERIENCE.DEFAULT)
+    self._reset_safety_hooks()
+    self._after_safety_reset()
+    self._rx(self._moving_msg(True))
+
+  def _after_safety_reset(self):
+    pass
+
+  def _engage_without_cruise(self):
+    self._cruise_engage()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._cruise_disengage()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_always_on_lateral_off_needs_controls_allowed(self):
+    self._always_on(False)
+    self._engage_without_cruise()
+    self.assertFalse(self.safety.get_lateral_engaged())
+    self.assertFalse(self._lateral_cmd_allowed())
+    self._cruise_engage()
+    self.assertTrue(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_needs_driver_engagement(self):
+    self._always_on()
+    self.assertFalse(self.safety.get_lateral_engaged())
+    self.assertFalse(self._lateral_cmd_allowed())
+    # setting the flag only is not an engagement
+    self.safety.set_controls_allowed(True)
+    self.safety.set_controls_allowed(False)
+    self.assertFalse(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_outlives_cruise(self):
+    self._always_on()
+    self._engage_without_cruise()
+    self.assertTrue(self.safety.get_lateral_engaged())
+    self.assertTrue(self._lateral_cmd_allowed())
+    # a new cruise engagement keeps it engaged
+    self._cruise_engage()
+    self.assertTrue(self._lateral_cmd_allowed())
+    self._cruise_disengage()
+    self.assertTrue(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_blocked_while_braking(self):
+    self._always_on()
+    self._engage_without_cruise()
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self._lateral_cmd_allowed())
+    self.assertTrue(self.safety.get_lateral_engaged())
+    self._rx(self._user_brake_msg(False))
+    self.assertTrue(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_blocked_at_standstill(self):
+    self._always_on()
+    self._engage_without_cruise()
+    self._rx(self._moving_msg(False))
+    self.assertFalse(self._lateral_cmd_allowed())
+    self._rx(self._moving_msg(True))
+    self.assertTrue(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_rx_lag_disengages(self):
+    self._always_on()
+    self._engage_without_cruise()
+    # no RX check was received: the tick marks them invalid and lateral needs a new engagement
+    self.safety.set_timer(int(2e6))
+    self.safety.safety_tick()
+    self.assertFalse(self.safety.get_lateral_engaged())
+    self.assertFalse(self._lateral_cmd_allowed())
+    self.safety.set_lateral_engaged(True)
+    self.assertFalse(self._lateral_cmd_allowed())  # RX checks are still invalid
+
+  def test_always_on_lateral_invalid_rx_disengages(self):
+    self._always_on()
+    self._engage_without_cruise()
+    for _ in range(10):  # repeated counters invalidate the message
+      self._rx(self._stale_counter_msg())
+    self.assertFalse(self.safety.get_lateral_engaged())
+    self.assertFalse(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_safety_mode_reset(self):
+    self._always_on()
+    self._engage_without_cruise()
+    self._reset_safety_hooks()
+    self._after_safety_reset()
+    self._rx(self._moving_msg(True))
+    self.assertFalse(self.safety.get_lateral_engaged())
+    self.assertFalse(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_lfa_button(self):
+    for always_on in (False, True):
+      with self.subTest(always_on=always_on):
+        self._always_on(always_on)
+        self._rx(self._button_msg(Buttons.NONE, lfa_button=1) if self.LFA_BUTTON else self._button_msg(Buttons.NONE))
+        engaged = always_on and self.LFA_BUTTON
+        self.assertEqual(engaged, self.safety.get_lateral_engaged())
+        self.assertFalse(self.safety.get_controls_allowed())
+        self.assertEqual(engaged, self._lateral_cmd_allowed())
+
+
 class HyundaiLongitudinalBase(common.LongitudinalAccelSafetyTest):
 
   DISABLED_ECU_UDS_MSG: tuple[int, int]
@@ -102,6 +228,14 @@ class HyundaiLongitudinalBase(common.LongitudinalAccelSafetyTest):
 
   def _pcm_status_msg(self, enable):
     raise Exception
+
+  def _cruise_engage(self):
+    self._rx(self._button_msg(Buttons.SET))
+    self._rx(self._button_msg(Buttons.NONE))
+
+  def _cruise_disengage(self):
+    self._rx(self._button_msg(Buttons.CANCEL))
+    self._rx(self._button_msg(Buttons.NONE))
 
   def _accel_msg(self, accel, aeb_req=False, aeb_decel=0):
     raise NotImplementedError

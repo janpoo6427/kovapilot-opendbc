@@ -9,7 +9,7 @@ from opendbc.car import Bus, gen_empty_fingerprint
 from opendbc.car.structs import CarParams
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.carcontroller import (ANGLE_DRIVER_TORQUE_LIMIT, ANGLE_DRIVER_TORQUE_RELEASE_FRAMES,
+from opendbc.car.hyundai.carcontroller import (hyundai_angle_lateral_authorized, ANGLE_DRIVER_TORQUE_LIMIT, ANGLE_DRIVER_TORQUE_RELEASE_FRAMES,
                                                 ANGLE_ENGAGE_GRACE_FRAMES, CarController, apply_hyundai_angle_limits,
                                                 get_hyundai_steering_output_can,
                                                 update_hyundai_angle_engage, update_hyundai_angle_handover,
@@ -176,6 +176,28 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
     self.assertEqual(get_hyundai_steering_output_can(True, True, 0.6, 123), 150)
     self.assertEqual(get_hyundai_steering_output_can(True, False, 0.6, 123), 0)
     self.assertEqual(get_hyundai_steering_output_can(False, False, 0.6, 123), 123)
+
+  def test_angle_lateral_authority_follows_panda_safety(self):
+    # stock longitudinal: stock cruise, or always-on lateral; openpilot longitudinal: always
+    for lat_active in (False, True):
+      for op_long in (False, True):
+        for cruise in (False, True):
+          for always_on in (False, True):
+            expected = lat_active and (op_long or cruise or always_on)
+            self.assertEqual(expected, hyundai_angle_lateral_authorized(lat_active, op_long, cruise, always_on))
+
+  def test_always_on_lateral_hud_and_authority(self):
+    from opendbc.safety import ALTERNATIVE_EXPERIENCE
+    CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, TestHyundaiFingerprint._ioniq9_fingerprint(), TestHyundaiFingerprint._ioniq9_fw(),
+                                 False, False, False)
+    self.assertFalse(CarController(DBC[CP.carFingerprint], CP).always_on_lateral)
+    CP.alternativeExperience |= ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    self.assertTrue(controller.always_on_lateral)
+    for enabled, lat_active, shown in ((False, False, False), (False, True, True), (True, False, True), (True, True, True)):
+      self.assertEqual(shown, controller.lateral_hud_enabled(SimpleNamespace(enabled=enabled, latActive=lat_active)))
+    controller.always_on_lateral = False
+    self.assertFalse(controller.lateral_hud_enabled(SimpleNamespace(enabled=False, latActive=True)))
 
   def test_angle_engage_waits_for_stable_authority(self):
     frames = 0
