@@ -35,6 +35,8 @@ ANGLE_DRIVER_TORQUE_RELEASE_FRAMES = 10
 ANGLE_ENGAGE_GRACE_FRAMES = 50
 ANGLE_FILTER_RC_BP = (5.0, 10.0, 20.0)
 ANGLE_FILTER_RC_V = (0.2, 0.1, 0.0)
+# A CCNC_0x161 copy must reach panda before the next stock frame (50 ms); copies of older frames are not sent
+CCNC_COPY_MAX_AGE_NS = 20_000_000
 
 
 class HyundaiCanFDAngleParams:
@@ -155,6 +157,7 @@ class CarController(CarControllerBase):
     self.angle_override_latched = False
     self.angle_override_release_frames = 0
     self.angle_engage_frames = 0
+    self.ccnc_161_nanos_last = 0
     self.always_on_lateral = bool(CP.alternativeExperience & ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
@@ -232,7 +235,7 @@ class CarController(CarControllerBase):
     # *** CAN/CAN FD specific ***
     if self.CP.flags & HyundaiFlags.CANFD:
       can_sends.extend(self.create_canfd_msgs(apply_steer_req, apply_torque, set_speed_in_units, accel,
-                                              stopping, hud_control, CS, CC))
+                                              stopping, hud_control, CS, CC, now_nanos))
     else:
       # Hold torque with induced temporary fault when cutting the actuation bit
       # FIXME: we don't use this with CAN FD?
@@ -301,7 +304,8 @@ class CarController(CarControllerBase):
 
     return can_sends
 
-  def create_canfd_msgs(self, apply_steer_req, apply_torque, set_speed_in_units, accel, stopping, hud_control, CS, CC):
+  def create_canfd_msgs(self, apply_steer_req, apply_torque, set_speed_in_units, accel, stopping, hud_control, CS, CC,
+                        now_nanos=None):
     can_sends = []
 
     lka_steering = self.CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG
@@ -313,6 +317,13 @@ class CarController(CarControllerBase):
       can_sends.append(hyundaicanfd.create_angle_steering(self.packer, self.CAN, self.frame, self.angle_active,
                                                           self.apply_angle_last, self.angle_torque_reduction_gain, CS.lfa_alt))
       can_sends.append(hyundaicanfd.create_angle_camera_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt))
+      # While openpilot steers, send one copy of each new stock CCNC_0x161 frame with the camera hands-on warning
+      # removed. panda forwards the stock frame instead when this copy is missing, late or older than 150 ms.
+      ccnc_161_nanos = getattr(CS, "ccnc_161_nanos", 0)
+      ccnc_fresh = now_nanos is not None and 0 <= now_nanos - ccnc_161_nanos <= CCNC_COPY_MAX_AGE_NS
+      if CC.latActive and ccnc_161_nanos != self.ccnc_161_nanos_last and ccnc_fresh:
+        can_sends.append(hyundaicanfd.create_ccnc_hands_on_cleared(self.packer, self.CAN, CS.ccnc_161))
+      self.ccnc_161_nanos_last = ccnc_161_nanos
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, self.lateral_hud_enabled(CC),
                                                              apply_steer_req, apply_torque))

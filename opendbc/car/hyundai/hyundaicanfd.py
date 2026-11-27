@@ -92,6 +92,22 @@ def create_angle_camera_mdps(packer, CAN, mdps, lfa_alt):
   return packer.make_can_msg("MDPS", CAN.CAM, values)
 
 
+# CCNC_0x161 ALERTS_2 values that ask the driver to hold the wheel (DBC VAL_ 353 ALERTS_2):
+# 1 KEEP_HANDS_ON_STEERING_WHEEL, 2 KEEP_HANDS_ON_STEERING_WHEEL_RED. The stock camera keeps running its own
+# hands-off timer while openpilot steers (IONIQ 9, 2026-11-27: 6 warnings in 46 min, red one with SOUNDS_2=3).
+CCNC_HANDS_ON_ALERTS = (1, 2)
+
+
+def create_ccnc_hands_on_cleared(packer, CAN, ccnc):
+  # Copy of the stock camera frame with only the hands-on warning and its chime removed. Every other
+  # signal, including the stock COUNTER, is copied verbatim; the packer recomputes the checksum.
+  values = dict(ccnc)
+  if values.get("ALERTS_2") in CCNC_HANDS_ON_ALERTS:
+    values["ALERTS_2"] = 0
+    values["SOUNDS_2"] = 0
+  return packer.make_can_msg("CCNC_0x161", CAN.ECAN, values)
+
+
 def create_suppress_lfa(packer, CAN, lfa_block_msg, lka_steering_alt):
   suppress_msg = "CAM_0x362" if lka_steering_alt else "CAM_0x2a4"
   msg_bytes = 32 if lka_steering_alt else 24
