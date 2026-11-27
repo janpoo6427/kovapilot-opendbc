@@ -16,6 +16,11 @@ from opendbc.car.hyundai.tests import test_hyundai
 
 # SETSPEED_SPEED is bits 200..207
 SET_SPEED_BITS = set(range(200, 208))
+# cruise display fields shown from the openpilot cruise state: SETSPEED_HUD, DISTANCE_CAR, DISTANCE, SETSPEED, LFA_ICON
+CRUISE_DISPLAY_BITS = set(range(181, 184)) | set(range(189, 192)) | set(range(196, 200)) | set(range(208, 212)) | set(range(224, 228))
+GRAY = {"SETSPEED": 1, "SETSPEED_HUD": 1, "DISTANCE_CAR": 1, "LFA_ICON": 1}
+ENGAGED = {"SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2}
+STOCK_OFF = {"SETSPEED": 0, "SETSPEED_HUD": 0, "DISTANCE_CAR": 0, "DISTANCE": 0, "SETSPEED_SPEED": 255, "LFA_ICON": 0}
 
 
 def ioniq9_long():
@@ -26,19 +31,22 @@ def ioniq9_long():
   return CP, CarInterface(CP), CANPacker(DBC[CP.carFingerprint][Bus.pt])
 
 
-def car_control(enabled, lat_active, set_speed_kph):
+def car_control(enabled, lat_active, set_speed_kph, bars=0):
   CC = structs.CarControl()
   CC.enabled = enabled
   CC.latActive = lat_active
   CC.longActive = enabled
   CC.hudControl.setSpeed = set_speed_kph * CV.KPH_TO_MS
+  CC.hudControl.leadDistanceBars = bars
   return CC.as_reader()
 
 
-def run(CI, packer, stock, CC, frame=0):
+def run(CI, packer, stock, CC, frame=0, cruise_available=True):
   t = (frame + 1) * STEP_NS
-  msg = CanData(*packer.make_can_msg("CCNC_0x161", CanBus(CI.CP).CAM, stock)) if stock is not None else None
-  CI.update([(t, [msg] if msg is not None else [])])
+  msgs = [CanData(*packer.make_can_msg("CCNC_0x161", CanBus(CI.CP).CAM, stock))] if stock is not None else []
+  # TCS ACCEnable 0: the car allows cruise (CarState.cruiseState.available)
+  msgs.append(CanData(*packer.make_can_msg("TCS", CanBus(CI.CP).ECAN, {"ACCEnable": 0 if cruise_available else 1})))
+  CI.update([(t, msgs)])
   _, sends = CI.apply(CC, t)
   return sends
 
@@ -106,8 +114,13 @@ class TestCcncSetSpeed(unittest.TestCase):
       self.assertEqual(len(copies), 1)
       before, after = bits(dat_stock), bits(copies[0][1])
       changed = {i for i in range(len(before)) if before[i] != after[i]}
-      self.assertTrue(changed <= SET_SPEED_BITS | CHECKSUM_BITS, sorted(changed - SET_SPEED_BITS - CHECKSUM_BITS))
+      # KOVA 11/27 launch: the cruise icons now show the openpilot state too (engaged here, LFA gray without steering)
+      allowed = SET_SPEED_BITS | CRUISE_DISPLAY_BITS | CHECKSUM_BITS
+      self.assertTrue(changed <= allowed, sorted(changed - allowed))
       self.assertEqual(sum(after[200 + i] << i for i in range(8)), int(set_kph))
+      copy = signals(copies, 0x161, "CCNC_0x161")
+      shown = {k: copy[k] for k in ("SETSPEED", "SETSPEED_HUD", "DISTANCE_CAR", "LFA_ICON", "DISTANCE")}
+      self.assertEqual(shown, {**ENGAGED, "LFA_ICON": 1, "DISTANCE": stock_values["DISTANCE"]})
 
   def test_stock_set_speed_without_long_engaged(self):
     # stock longitudinal, or openpilot longitudinal not engaged (always-on lateral only): stock set speed
@@ -117,17 +130,74 @@ class TestCcncSetSpeed(unittest.TestCase):
     sends = run(CI, packer, {"COUNTER": 1, "SETSPEED_SPEED": 30}, car_control(True, True, 40.0))
     self.assertEqual(signals([s for s in sends if s[0] == 0x161], 0x161, "CCNC_0x161")["SETSPEED_SPEED"], 30)
 
+    # KOVA 11/27 launch: openpilot longitudinal available but not engaged (always-on lateral steering): the gray
+    # openpilot cruise with its set speed, LFA green while steering (was: stock set speed 30)
     CP, _, packer = ioniq9_long()
     CP.alternativeExperience |= ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL
     CI = CarInterface(CP)
     sends = run(CI, packer, {"COUNTER": 1, "SETSPEED_SPEED": 30}, car_control(False, True, 40.0))
+    copy = signals([s for s in sends if s[0] == 0x161], 0x161, "CCNC_0x161")
+    self.assertEqual((copy["SETSPEED_SPEED"], copy["SETSPEED"], copy["SETSPEED_HUD"], copy["LFA_ICON"]), (40, 1, 1, 2))
+    # with cruise not available: the stock set speed
+    sends = run(CI, packer, {"COUNTER": 2, "SETSPEED_SPEED": 30}, car_control(False, True, 40.0), 1, cruise_available=False)
     self.assertEqual(signals([s for s in sends if s[0] == 0x161], 0x161, "CCNC_0x161")["SETSPEED_SPEED"], 30)
 
   def test_no_copy_when_nothing_engaged(self):
+    # KOVA 11/27 launch: only with cruise not available (TCS ACCEnable); available gives the gray copy below
     _, CI, packer = ioniq9_long()
-    for frame in range(0, 40, 5):
-      sends = run(CI, packer, {"COUNTER": frame // 5, "SETSPEED_SPEED": 30}, car_control(False, False, 40.0), frame)
+    # the first TCS frame only arms the parser
+    run(CI, packer, None, car_control(False, False, 40.0), 0, cruise_available=False)
+    for frame in range(5, 45, 5):
+      sends = run(CI, packer, {"COUNTER": frame // 5, "SETSPEED_SPEED": 30}, car_control(False, False, 40.0), frame,
+                  cruise_available=False)
       self.assertEqual([s for s in sends if s[0] == 0x161], [])
+
+  def test_gray_cruise_while_available(self):
+    # from ignition on, openpilot longitudinal available and not engaged: gray cruise and LFA icons, no set speed yet
+    # (255 as the stock camera), the openpilot gap bars; warnings, sounds and every other signal stay stock
+    _, CI, packer = ioniq9_long()
+    stock = {**STOCK_OFF, "COUNTER": 3, "ALERTS_2": 1, "SOUNDS_2": 2, "FCA_ICON": 1, "LKA_ICON": 3}
+    sends = run(CI, packer, stock, car_control(False, False, 255.0, bars=4))
+    copies = [s for s in sends if s[0] == 0x161]
+    self.assertEqual(len(copies), 1)
+    copy = signals(copies, 0x161, "CCNC_0x161")
+    shown = {k: copy[k] for k in ("SETSPEED", "SETSPEED_HUD", "DISTANCE_CAR", "LFA_ICON", "SETSPEED_SPEED", "DISTANCE")}
+    self.assertEqual(shown, {**GRAY, "SETSPEED_SPEED": 255, "DISTANCE": 4})
+    self.assertEqual((copy["ALERTS_2"], copy["SOUNDS_2"], copy["FCA_ICON"], copy["LKA_ICON"], copy["COUNTER"]), (1, 2, 1, 3, 3))
+    # after a disengagement the last openpilot set speed stays shown, gray
+    sends = run(CI, packer, {**stock, "COUNTER": 4}, car_control(False, False, 57.0), 1)
+    copy = signals([s for s in sends if s[0] == 0x161], 0x161, "CCNC_0x161")
+    self.assertEqual((copy["SETSPEED_SPEED"], copy["SETSPEED"], copy["DISTANCE"]), (57, 1, 0))
+
+  def test_gray_cruise_changes_only_display_bits(self):
+    # the gray copy differs from the stock frame only in the bits panda allows without control
+    rng = random.Random(0x1611)
+    _, CI, packer = ioniq9_long()
+    for frame in range(0, 200, 5):
+      stock = random_ccnc(packer, rng, bus=CanBus(CI.CP).CAM)
+      stock_values = signals([stock], 0x161, "CCNC_0x161")
+      stock_values.pop("CHECKSUM")
+      t = (frame + 1) * STEP_NS
+      _, dat_stock, _ = packer.make_can_msg("CCNC_0x161", CanBus(CI.CP).CAM, stock_values)
+      CI.update([(t, [CanData(0x161, dat_stock, CanBus(CI.CP).CAM)])])
+      _, sends = CI.apply(car_control(False, False, float(rng.randrange(30, 150)), bars=rng.randrange(0, 5)), t)
+      copies = [s for s in sends if s[0] == 0x161]
+      self.assertEqual(len(copies), 1)
+      before, after = bits(dat_stock), bits(copies[0][1])
+      changed = {i for i in range(len(before)) if before[i] != after[i]}
+      allowed = SET_SPEED_BITS | CRUISE_DISPLAY_BITS | CHECKSUM_BITS
+      self.assertTrue(changed <= allowed, sorted(changed - allowed))
+      copy = signals(copies, 0x161, "CCNC_0x161")
+      self.assertEqual({k: copy[k] for k in GRAY}, GRAY)
+
+  def test_engaged_cruise_icons(self):
+    # openpilot longitudinal engaged without the stock camera cruise on (no MAIN press): engaged icons and gap bars
+    for lat_active, lfa in ((True, 2), (False, 1)):
+      _, CI, packer = ioniq9_long()
+      sends = run(CI, packer, {**STOCK_OFF, "COUNTER": 1}, car_control(True, lat_active, 8.0, bars=3))
+      copy = signals([s for s in sends if s[0] == 0x161], 0x161, "CCNC_0x161")
+      shown = {k: copy[k] for k in ("SETSPEED", "SETSPEED_HUD", "DISTANCE_CAR", "LFA_ICON", "DISTANCE", "SETSPEED_SPEED")}
+      self.assertEqual(shown, {**ENGAGED, "LFA_ICON": lfa, "DISTANCE": 3, "SETSPEED_SPEED": 8}, lat_active)
 
   def test_one_copy_per_stock_frame_while_long_engaged(self):
     _, CI, packer = ioniq9_long()

@@ -87,9 +87,39 @@ static void hyundai_canfd_pedal_resume(bool pedal_edge) {
   }
 }
 
+// Without control authority the host may still show the openpilot cruise as ready on the cluster: the copy must be
+// the held stock camera frame with only the display bits below changed, and those icons only hidden or gray (0 or 1),
+// so warnings, sounds and every other camera signal stay stock and nothing looks engaged.
+static bool hyundai_canfd_ccnc_display_only(const CANPacket_t *msg) {
+  // CCNC_0x161 bits that may change, per byte: CHECKSUM (bytes 0-1, checked on its own), SETSPEED_HUD (byte 22 bits 5-7),
+  // DISTANCE_CAR (byte 23 bits 5-7), DISTANCE gap bars (byte 24 bits 4-7), SETSPEED_SPEED (byte 25),
+  // SETSPEED (byte 26 bits 0-3), LFA_ICON (byte 28 bits 0-3)
+  static const uint8_t HYUNDAI_CANFD_CCNC_DISPLAY_BITS[32] = {
+    0xFFU, 0xFFU, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
+    0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0xE0U, 0xE0U, 0xF0U, 0xFFU, 0x0FU, 0x00U, 0x0FU, 0x00U, 0x00U, 0x00U,
+  };
+  uint8_t diff = 0U;
+  for (uint8_t i = 0U; i < 32U; i++) {
+    diff |= (uint8_t)((msg->data[i] ^ safety.hyundai_ccnc_stock[i]) & (uint8_t)(~HYUNDAI_CANFD_CCNC_DISPLAY_BITS[i]));
+  }
+  const uint8_t setspeed_hud = (msg->data[22] >> 5U) & 0x7U;
+  const uint8_t distance_car = (msg->data[23] >> 5U) & 0x7U;
+  const uint8_t setspeed = msg->data[26] & 0xFU;
+  const uint8_t lfa_icon = msg->data[28] & 0xFU;
+  const bool gray_icons = (setspeed_hud <= 1U) && (distance_car <= 1U) && (setspeed <= 1U) && (lfa_icon <= 1U);
+  return safety.hyundai_ccnc_stock_valid && (diff == 0U) && gray_icons;
+}
+
 static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   const unsigned pt_bus = safety_setup.hyundai_canfd_lka_steer_msg ? 1U : 0U;
   const unsigned int scc_bus = safety_setup.hyundai_camera_scc ? 2U : pt_bus;
+
+  if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0x161U, 2U, 32U)) {
+    for (uint8_t i = 0U; i < 32U; i++) {
+      safety.hyundai_ccnc_stock[i] = msg->data[i];
+    }
+    safety.hyundai_ccnc_stock_valid = true;
+  }
 
   if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0xCBU, 2U)) {
     safety.hyundai_angle_stock_lfa_state = msg->data[3] >> 4U;
@@ -359,13 +389,16 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   }
 
   // CCNC_0x161 (cluster): the host copy of a stock camera frame goes out only in place of the stock frame
-  // that the forwarding hook held back for it, once, while lateral control is allowed.
+  // that the forwarding hook held back for it, once, while lateral control is allowed, or without control
+  // when it changes only the cruise display (hyundai_canfd_ccnc_display_only).
   if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0x161U, 0U)) {
-    const bool valid_copy = lateral_controls_allowed() &&
+    const bool display_only = hyundai_canfd_ccnc_display_only(msg);
+    const bool valid_copy = (lateral_controls_allowed() || display_only) &&
                             (hyundai_canfd_get_checksum(msg) == hyundai_common_canfd_compute_checksum(msg));
     if (valid_copy) {
       safety.hyundai_ccnc_host_seen = true;
       safety.hyundai_ccnc_host_ts = safety_ts;
+      safety.hyundai_ccnc_host_display = display_only;
     }
     if (!valid_copy || !safety.hyundai_ccnc_stock_pending) {
       tx = false;
@@ -444,7 +477,7 @@ static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
     }
     const bool host_fresh = safety.hyundai_ccnc_host_seen &&
                             (safety_get_ts_elapsed(safety_ts, safety.hyundai_ccnc_host_ts) < HYUNDAI_CANFD_CCNC_HOST_MAX_AGE_US);
-    block_msg = host_fresh && lateral_controls_allowed();
+    block_msg = host_fresh && (lateral_controls_allowed() || safety.hyundai_ccnc_host_display);
     safety.hyundai_ccnc_stock_pending = block_msg;
   }
   return block_msg;
@@ -530,8 +563,16 @@ static safety_config hyundai_canfd_init(uint16_t param) {
       HYUNDAI_CANFD_SCC_ADDR_CHECK(2)
       {.msg = {{0xCB, 2, 24, 100U, .max_counter = 0xffU, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     };
+    // openpilot longitudinal also reads the stock camera cluster frame CCNC_0x161 (20 Hz), the reference for
+    // host copies made without control authority (hyundai_canfd_ccnc_display_only)
+    static const RxCheck hyundai_canfd_angle_long_rx_checks[] = {
+      HYUNDAI_CANFD_STD_BUTTONS_RX_CHECKS(0)
+      HYUNDAI_CANFD_SCC_ADDR_CHECK(2)
+      {.msg = {{0xCB, 2, 24, 100U, .max_counter = 0xffU, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+      {.msg = {{0x161, 2, 32, 20U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    };
     if (safety_setup.hyundai_longitudinal) {
-      ret = BUILD_SAFETY_CFG(hyundai_canfd_angle_rx_checks, HYUNDAI_CANFD_ANGLE_STEERING_LONG_TX_MSGS);
+      ret = BUILD_SAFETY_CFG(hyundai_canfd_angle_long_rx_checks, HYUNDAI_CANFD_ANGLE_STEERING_LONG_TX_MSGS);
     } else {
       ret = BUILD_SAFETY_CFG(hyundai_canfd_angle_rx_checks, HYUNDAI_CANFD_ANGLE_STEERING_TX_MSGS);
     }

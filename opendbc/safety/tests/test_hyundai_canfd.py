@@ -987,11 +987,120 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     self.assertEqual(self.safety.safety_fwd_hook(0, 0x161), 2)
     self.assertEqual(self.safety.safety_fwd_hook(2, 0x162), 0)
 
+  # *** CCNC_0x161 without control authority: the cluster may show a ready (gray) openpilot cruise only ***
+
+  CCNC_STOCK_OFF = {"SETSPEED": 0, "SETSPEED_HUD": 0, "DISTANCE_CAR": 0, "DISTANCE": 0, "SETSPEED_SPEED": 255, "LFA_ICON": 0,
+                    "LKA_ICON": 3, "ALERTS_2": 1, "SOUNDS_2": 2, "FCA_ICON": 1, "HDA_ICON": 1}
+  CCNC_GRAY = {"SETSPEED": 1, "SETSPEED_HUD": 1, "DISTANCE_CAR": 1, "DISTANCE": 4, "SETSPEED_SPEED": 40, "LFA_ICON": 1}
+  CCNC_DISPLAY_SIGNALS = ("CHECKSUM", "SETSPEED", "SETSPEED_HUD", "DISTANCE_CAR", "DISTANCE", "SETSPEED_SPEED", "LFA_ICON")
+  # panda reads the stock CCNC_0x161 frame (the reference for copies without control) only with openpilot longitudinal
+  CCNC_DISPLAY_WITHOUT_CONTROL = False
+
+  def _ccnc_display_mode(self):
+    if not self.CCNC_DISPLAY_WITHOUT_CONTROL:
+      self.skipTest("no cluster copy without control in this mode")
+
+  def _ccnc_values(self, counter, **values):
+    return {**self.CCNC_STOCK_OFF, "COUNTER": counter, **values}
+
+  def _ccnc_stock_frame(self, t_us, counter, bus=2):
+    # stock camera frame: received, then forwarded or held back
+    self.safety.set_timer(t_us)
+    self._rx(self.packer.make_can_msg_safety("CCNC_0x161", bus, self._ccnc_values(counter)))
+    return self.safety.safety_fwd_hook(2, 0x161) == 0
+
+  def _ccnc_display_cycles(self, start_frame, frames, copy_counter_offset=0, stock_bus=2, **copy_values):
+    # (stock forwarded, host copy sent) per stock frame; the copy is the stock frame with copy_values changed
+    out = []
+    for frame in range(start_frame, start_frame + frames):
+      t = frame * self.CCNC_PERIOD_US
+      forwarded = self._ccnc_stock_frame(t, frame & 0xFF, stock_bus)
+      copy = self.packer.make_can_msg_safety("CCNC_0x161", 0, self._ccnc_values((frame + copy_counter_offset) & 0xFF, **copy_values))
+      out.append((forwarded, self._ccnc_copy(t + self.CCNC_HOST_DELAY_US, frame, copy)))
+    return out
+
+  def test_ccnc_gray_copy_needs_longitudinal(self):
+    # without openpilot longitudinal no copy goes out without control, even with the stock frame received
+    if self.CCNC_DISPLAY_WITHOUT_CONTROL:
+      self.skipTest("longitudinal mode")
+    self.assertEqual(self._ccnc_display_cycles(1, 10, **self.CCNC_GRAY), [(True, False)] * 10)
+    self.assertEqual(self._ccnc_display_cycles(11, 3), [(True, False)] * 3)
+
+  def test_ccnc_gray_cruise_copy_without_control(self):
+    self._ccnc_display_mode()
+    self.safety.set_controls_allowed(False)
+    cycles = self._ccnc_display_cycles(1, 20, **self.CCNC_GRAY)
+    self.assertEqual(cycles[0], (True, False))
+    self.assertEqual(cycles[1:], [(False, True)] * 19)
+    self.assertFalse(self.safety.get_controls_allowed())
+    # hidden icons, no set speed yet and other gap bars are display only too
+    self.assertEqual(self._ccnc_display_cycles(21, 3, SETSPEED=0, SETSPEED_HUD=0, DISTANCE_CAR=0, LFA_ICON=0, DISTANCE=2),
+                     [(False, True)] * 3)
+    # an unchanged copy as well
+    self.assertEqual(self._ccnc_display_cycles(24, 3), [(False, True)] * 3)
+
+  def test_ccnc_copy_without_control_no_engaged_icons(self):
+    self._ccnc_display_mode()
+    # without control the copy may not look engaged
+    for name, value in (("SETSPEED", 2), ("SETSPEED", 3), ("SETSPEED_HUD", 2), ("DISTANCE_CAR", 2), ("LFA_ICON", 2), ("LFA_ICON", 5)):
+      self._reset_safety_hooks()
+      self._after_safety_reset()
+      self.assertEqual(self._ccnc_display_cycles(1, 3, **self.CCNC_GRAY)[1:], [(False, True)] * 2, (name, value))
+      self.assertEqual(self._ccnc_display_cycles(4, 1, **{**self.CCNC_GRAY, name: value}), [(False, False)], (name, value))
+      # the held-back frame is lost once, then stock goes out until a valid copy
+      self.assertEqual(self._ccnc_display_cycles(5, 2, **self.CCNC_GRAY), [(True, False), (False, True)], (name, value))
+      # with control the same copy is fine
+      self.safety.set_controls_allowed(True)
+      self.assertEqual(self._ccnc_display_cycles(7, 2, **{**self.CCNC_GRAY, name: value}), [(False, True)] * 2, (name, value))
+
+  def test_ccnc_copy_without_control_keeps_other_signals(self):
+    self._ccnc_display_mode()
+    # every signal outside the cruise display, like the camera warnings, sounds and lane drawing, must stay stock
+    sigs = self.packer.dbc.name_to_msg["CCNC_0x161"].sigs
+    changed = [name for name in sigs if name not in self.CCNC_DISPLAY_SIGNALS]
+    self.assertGreater(len(changed), 40)
+    for name in changed:
+      self._reset_safety_hooks()
+      self._after_safety_reset()
+      self._ccnc_display_cycles(1, 2, **self.CCNC_GRAY)
+      stock = self._ccnc_values(3)[name] if name in self.CCNC_STOCK_OFF or name == "COUNTER" else 0
+      other = (int(stock) + 1) % (1 << sigs[name].size)
+      if name == "COUNTER":
+        cycles = self._ccnc_display_cycles(3, 1, copy_counter_offset=1, **self.CCNC_GRAY)
+      else:
+        cycles = self._ccnc_display_cycles(3, 1, **{**self.CCNC_GRAY, name: other})
+      self.assertEqual(cycles, [(False, False)], name)
+      self.safety.set_controls_allowed(True)
+      self.assertEqual(self._ccnc_display_cycles(4, 2, **{**self.CCNC_GRAY, name: other} if name != "COUNTER" else self.CCNC_GRAY),
+                       [(True, False), (False, True)], name)
+
+  def test_ccnc_copy_without_control_needs_camera_frame(self):
+    self._ccnc_display_mode()
+    # the comparison frame is the stock camera frame on bus 2 only
+    self.assertEqual(self._ccnc_display_cycles(1, 5, stock_bus=0, **self.CCNC_GRAY), [(True, False)] * 5)
+    # a copy of the previous stock frame no longer matches once the next one is received
+    self._reset_safety_hooks()
+    self._after_safety_reset()
+    self._ccnc_display_cycles(1, 3, **self.CCNC_GRAY)
+    self.assertEqual(self._ccnc_display_cycles(4, 1, copy_counter_offset=-1, **self.CCNC_GRAY), [(False, False)])
+
+  def test_ccnc_gray_copy_then_control(self):
+    self._ccnc_display_mode()
+    # the gray copy keeps replacing stock frames when control comes and goes; engaged-looking copies need control
+    self._ccnc_display_cycles(1, 2, **self.CCNC_GRAY)
+    self.safety.set_controls_allowed(True)
+    engaged = {**self.CCNC_GRAY, "SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2, "LFA_ICON": 2, "ALERTS_2": 0, "SOUNDS_2": 0}
+    self.assertEqual(self._ccnc_display_cycles(3, 3, **engaged), [(False, True)] * 3)
+    self.safety.set_controls_allowed(False)
+    # the last copy looked engaged: stock goes out first, then the gray copy again
+    self.assertEqual(self._ccnc_display_cycles(6, 3, **self.CCNC_GRAY), [(True, False), (False, True), (False, True)])
+
 
 class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanfdAngleSteering):
 
   SAFETY_PARAM = (HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CAMERA_SCC |
                   HyundaiSafetyFlags.CANFD_ANGLE_STEERING | HyundaiSafetyFlags.LONG)
+  CCNC_DISPLAY_WITHOUT_CONTROL = True
 
   TX_MSGS = [[0xCB, 0], [0xEA, 2], [0x1A0, 0]]
   RELAY_MALFUNCTION_ADDRS = {0: (0xCB, 0x1A0), 2: (0xEA,)}

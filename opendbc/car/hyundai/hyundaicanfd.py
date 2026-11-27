@@ -100,19 +100,35 @@ CCNC_HANDS_ON_ALERTS = (1, 2)
 # CCNC_0x161 LFA_ICON (DBC VAL_ 353 LFA_ICON): 1 GRAY, 2 GREEN. The stock camera keeps the cluster LFA icon gray
 # while openpilot steers (IONIQ 9 rlog 0000079c, 2026-11-27: LFA_ICON 1 in 4604 of 4611 frames with latActive, never 2).
 CCNC_LFA_ICON_ACTIVE = 2
+CCNC_LFA_ICON_READY = 1
+
+# Cluster cruise icons (CCNC_0x161 SETSPEED, SETSPEED_HUD, DISTANCE_CAR) as the stock camera draws them for its
+# own cruise state (CAN-FD angle steering car, rlog 0000079b/0000079c 2026-11-27): main off 0/0/0 with set speed 255,
+# main on and not engaged 1/1/1 (gray), engaged 3/2/2. The stock camera only follows its own MAIN button, so with
+# openpilot longitudinal the cluster showed no cruise or LFA icon at all, also while openpilot drove (0000079d/0000079e).
+CCNC_CRUISE_READY = {"SETSPEED": 1, "SETSPEED_HUD": 1, "DISTANCE_CAR": 1}
+CCNC_CRUISE_ENGAGED = {"SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2}
 
 
-def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_hands_on=True, set_speed=None):
+def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_hands_on=True, set_speed=None,
+                                 cruise_icons=None, distance_bars=0):
   # Copy of the stock camera frame with only the hands-on warning and its chime removed, the LFA icon
-  # shown green while openpilot steers, and, with openpilot longitudinal engaged, the cluster set speed
+  # shown green while openpilot steers, and, with openpilot longitudinal, the cluster set speed
   # (SETSPEED_SPEED) replaced by the openpilot set speed in display units, packed like SCC_CONTROL VSetDis.
   # The stock camera keeps its own set speed there (CAN-FD angle steering car, rlog 0000079c 2026-11-27: cluster
-  # 30 km/h while openpilot and SCC_CONTROL VSetDis were 40 km/h). Every other signal, including the stock COUNTER
-  # and the SETSPEED icon state, is copied verbatim; the packer recomputes the checksum.
+  # 30 km/h while openpilot and SCC_CONTROL VSetDis were 40 km/h).
+  # cruise_icons (CCNC_CRUISE_READY or CCNC_CRUISE_ENGAGED) shows the openpilot longitudinal state instead of the
+  # stock camera cruise state, with the openpilot gap bars (DISTANCE) and, unless openpilot steers, a gray LFA icon.
+  # Every other signal, including the stock COUNTER, is copied verbatim; the packer recomputes the checksum.
   values = dict(ccnc)
   if clear_hands_on and values.get("ALERTS_2") in CCNC_HANDS_ON_ALERTS:
     values["ALERTS_2"] = 0
     values["SOUNDS_2"] = 0
+  if cruise_icons is not None:
+    values.update(cruise_icons)
+    values["LFA_ICON"] = CCNC_LFA_ICON_READY
+    if distance_bars > 0:
+      values["DISTANCE"] = distance_bars
   if lateral_active:
     values["LFA_ICON"] = CCNC_LFA_ICON_ACTIVE
   if set_speed is not None:

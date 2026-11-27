@@ -353,6 +353,9 @@ typedef struct {
   bool hyundai_ccnc_host_seen;      // host sent a valid CCNC_0x161 copy and has not fallen behind since
   uint32_t hyundai_ccnc_host_ts;    // last valid host CCNC_0x161 copy
   bool hyundai_ccnc_stock_pending;  // the last stock CCNC_0x161 was held back and waits for its host copy
+  uint8_t hyundai_ccnc_stock[32];   // last stock CCNC_0x161 frame from the camera
+  bool hyundai_ccnc_stock_valid;
+  bool hyundai_ccnc_host_display;   // the last valid host copy changed only the cruise display (no control needed)
   bool hyundai_pedal_resume_blocked;  // CANCEL pressed since the last SET/RES; blocks pedal resume
   bool tesla_stock_aeb;
   // Only rising edges while controls are not allowed are considered for these systems:

@@ -43,6 +43,7 @@ ANGLE_FILTER_RC_BP = (5.0, 10.0, 20.0)
 ANGLE_FILTER_RC_V = (0.2, 0.1, 0.0)
 # A CCNC_0x161 copy must reach panda before the next stock frame (50 ms); copies of older frames are not sent
 CCNC_COPY_MAX_AGE_NS = 20_000_000
+CCNC_SET_SPEED_UNSET = 255
 
 
 class HyundaiCanFDAngleParams:
@@ -367,16 +368,25 @@ class CarController(CarControllerBase):
       can_sends.append(hyundaicanfd.create_angle_camera_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt))
       # While openpilot steers, send one copy of each new stock CCNC_0x161 frame with the camera hands-on warning
       # removed and the cluster LFA icon green (also with always-on lateral, see lateral_hud_enabled).
-      # While openpilot longitudinal is engaged (also at standstill, when lateral pauses), the copy shows the
-      # openpilot set speed; the hands-on warning and LFA icon then change only while openpilot steers.
+      # With openpilot longitudinal, the copy shows the openpilot cruise state instead of the stock camera one:
+      # gray cruise and LFA icons while cruise is available but not engaged (from ignition on), the engaged
+      # icons while engaged (also at standstill, when lateral pauses), with the openpilot set speed and gap bars.
+      # The hands-on warning and the green LFA icon change only while openpilot steers; without control authority
+      # panda passes only copies that differ from the stock frame in these gray icons, set speed and gap bars.
       # panda forwards the stock frame instead when this copy is missing, late or older than 150 ms.
       ccnc_161_nanos = getattr(CS, "ccnc_161_nanos", 0)
       ccnc_fresh = now_nanos is not None and 0 <= now_nanos - ccnc_161_nanos <= CCNC_COPY_MAX_AGE_NS
       long_engaged = bool(self.CP.openpilotLongitudinalControl and CC.enabled)
-      if (CC.latActive or long_engaged) and ccnc_161_nanos != self.ccnc_161_nanos_last and ccnc_fresh:
+      long_ready = bool(self.CP.openpilotLongitudinalControl and not CC.enabled and CS.out.cruiseState.available)
+      if (CC.latActive or long_engaged or long_ready) and ccnc_161_nanos != self.ccnc_161_nanos_last and ccnc_fresh:
+        cruise_icons = (hyundaicanfd.CCNC_CRUISE_ENGAGED if long_engaged else
+                        hyundaicanfd.CCNC_CRUISE_READY if long_ready else None)
+        # no set speed yet (openpilot unset value 255 km/h): the stock camera unset value 255, also in mph
+        ccnc_set_speed = CCNC_SET_SPEED_UNSET if hud_control.setSpeed * CV.MS_TO_KPH > CCNC_SET_SPEED_UNSET - 0.5 else set_speed_in_units
         can_sends.append(hyundaicanfd.create_ccnc_hands_on_cleared(
           self.packer, self.CAN, CS.ccnc_161, CC.latActive and self.lateral_hud_enabled(CC),
-          clear_hands_on=CC.latActive, set_speed=set_speed_in_units if long_engaged else None))
+          clear_hands_on=CC.latActive, set_speed=ccnc_set_speed if cruise_icons is not None else None,
+          cruise_icons=cruise_icons, distance_bars=hud_control.leadDistanceBars))
       self.ccnc_161_nanos_last = ccnc_161_nanos
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, self.lateral_hud_enabled(CC),
