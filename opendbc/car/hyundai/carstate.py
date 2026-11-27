@@ -12,6 +12,9 @@ from opendbc.car.interfaces import CarStateBase
 ButtonType = structs.CarState.ButtonEvent.Type
 
 PREV_BUTTON_SAMPLES = 8
+# Blind-spot frames older than this are stale (carState.blindspotFresh false): LCA11 comes every 20 ms; 0x1BA every
+# 50 ms on the IONIQ 9 camera bus (largest gap 62 ms in two 60 s drive segments, 2026-11-27).
+BLINDSPOT_FRESH_NS = 500_000_000
 CLUSTER_SAMPLE_RATE = 20  # frames
 STANDSTILL_THRESHOLD = 12 * 0.03125
 
@@ -64,6 +67,11 @@ class CarState(CarStateBase):
     self.cluster_speed_counter = CLUSTER_SAMPLE_RATE
 
     self.params = CarControllerParams(CP)
+
+  @staticmethod
+  def blindspot_fresh(cp, msg: str, sig: str) -> bool:
+    seen = cp.ts_nanos[msg][sig]
+    return seen > 0 and 0 <= cp._last_update_nanos - seen <= BLINDSPOT_FRESH_NS
 
   def recent_button_interaction(self) -> bool:
     # On some newer model years, the CANCEL button acts as a pause/resume button based on the PCM state
@@ -176,6 +184,7 @@ class CarState(CarStateBase):
     if self.CP.flags & HyundaiFlags.HAS_BSM:
       ret.leftBlindspot = cp.vl["LCA11"]["CF_Lca_IndLeft"] != 0
       ret.rightBlindspot = cp.vl["LCA11"]["CF_Lca_IndRight"] != 0
+      ret.blindspotFresh = self.blindspot_fresh(cp, "LCA11", "CF_Lca_IndLeft")
 
     # save the entire LKAS11 and CLU11
     self.lkas11 = copy.copy(cp_cam.vl["LKAS11"])
@@ -251,11 +260,19 @@ class CarState(CarStateBase):
     left_blinker_sig, right_blinker_sig = "LEFT_LAMP", "RIGHT_LAMP"
     if self.CP.carFingerprint == CAR.HYUNDAI_KONA_EV_2ND_GEN:
       left_blinker_sig, right_blinker_sig = "LEFT_LAMP_ALT", "RIGHT_LAMP_ALT"
-    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, cp.vl["BLINKERS"][left_blinker_sig],
-                                                                      cp.vl["BLINKERS"][right_blinker_sig])
+    blinkers = cp.vl["BLINKERS"]
+    left_lamp, right_lamp = blinkers[left_blinker_sig], blinkers[right_blinker_sig]
+    if blinkers["USE_ALT_LAMP"]:
+      # IONIQ 9: USE_ALT_LAMP is 1 and only the ALT lamps flash (2026-11-27 drive, LEFT/RIGHT_LAMP stay 0)
+      left_lamp, right_lamp = left_lamp or blinkers["LEFT_LAMP_ALT"], right_lamp or blinkers["RIGHT_LAMP_ALT"]
+    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, left_lamp, right_lamp)
     if self.CP.flags & HyundaiFlags.HAS_BSM:
-      ret.leftBlindspot = bool(cp.vl["ADAS_CMD_50_50ms"]["BCW_LtIndSta"])
-      ret.rightBlindspot = bool(cp.vl["ADAS_CMD_50_50ms"]["BCW_RtIndSta"])
+      # 0x1BA is on the ECAN behind some harnesses and only on the camera bus behind others (IONIQ 9 camera-SCC
+      # harness: bus 2 every 50 ms, the ECAN only carries the comma's own copy). Read whichever bus has it newest.
+      bsm_cp = cp if cp.ts_nanos["ADAS_CMD_50_50ms"]["BCW_LtIndSta"] >= cp_cam.ts_nanos["ADAS_CMD_50_50ms"]["BCW_LtIndSta"] else cp_cam
+      ret.leftBlindspot = bool(bsm_cp.vl["ADAS_CMD_50_50ms"]["BCW_LtIndSta"])
+      ret.rightBlindspot = bool(bsm_cp.vl["ADAS_CMD_50_50ms"]["BCW_RtIndSta"])
+      ret.blindspotFresh = self.blindspot_fresh(bsm_cp, "ADAS_CMD_50_50ms", "BCW_LtIndSta")
 
     # Preserve the full stock camera SCC frame before openpilot replaces it.
     # The capability-qualified ADAS-harness path uses this as a template so
@@ -321,6 +338,8 @@ class CarState(CarStateBase):
       # state without making the entire powertrain parser invalid while quiet.
       msgs.append(("ADAS_CMD_50_50ms", math.nan))
     cam_msgs = []
+    if CP.flags & HyundaiFlags.HAS_BSM:
+      cam_msgs.append(("ADAS_CMD_50_50ms", math.nan))
     if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
       cam_msgs.append(("LFA_ALT", 100))
     if CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE:
