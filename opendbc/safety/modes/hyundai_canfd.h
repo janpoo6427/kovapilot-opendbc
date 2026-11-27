@@ -202,18 +202,20 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
 
   bool tx = true;
 
+  // Active angle commands are bounded by lateral accel and jerk (vehicle model) instead of a fixed
+  // angle and speed table. The absolute 175 degree limit and the 10 degree measured error stay.
   const AngleSteeringLimits HYUNDAI_CANFD_ANGLE_LIMITS = {
     .max_angle = 1750,
     .angle_deg_to_can = 10.0f,
-    .angle_rate_up_lookup = {
-      {0.0f, 5.0f, 25.0f},
-      {1.2f, 0.8f, 0.2f},
-    },
-    .angle_rate_down_lookup = {
-      {0.0f, 5.0f, 25.0f},
-      {1.5f, 1.0f, 0.3f},
-    },
     .frequency = 100U,
+  };
+
+  // IONIQ 9 (the only CAN-FD angle platform): slip factor from calc_slip_factor() with the IONIQ 9
+  // CarParams, steer ratio and wheelbase from its CarSpecs. sunnypilot uses the same IONIQ 9 values.
+  const AngleSteeringParams HYUNDAI_CANFD_ANGLE_PARAMS = {
+    .slip_factor = -0.0005358728290930592f,
+    .steer_ratio = 16.02f,
+    .wheelbase = 3.13f,
   };
 
   if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0xCBU, 0U)) {
@@ -232,23 +234,26 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
     // values above the physical 1.0/250 encoding remain blocked.
     const bool state_violation = steer_control_enabled ? ((gain == 0U) || (gain > 250U)) :
                                                          ((state != 1U) || (gain != 0U));
-    const bool active_angle_violation = steer_control_enabled &&
-                                        ((safety_abs_int(desired_angle) > 600) ||
-                                         (safety.angle_meas.min <= -600) || (safety.angle_meas.max >= 600));
-    const bool driver_override = steer_control_enabled &&
-                                 ((safety.torque_driver.min < -250) || (safety.torque_driver.max > 250));
     // without controls_allowed (always-on lateral), an MDPS fault blocks active control until it clears
     const bool lateral_mdps_fault = steer_control_enabled && !safety.controls_allowed && safety.hyundai_angle_mdps_fault;
-    const bool angle_violation = steer_angle_cmd_checks(desired_angle, steer_control_enabled, HYUNDAI_CANFD_ANGLE_LIMITS) ||
+    const bool vm_rt_checked = lateral_controls_allowed() && steer_control_enabled;
+    // Driver torque does not block active frames: the controller keeps steering and lowers the MDPS
+    // torque ceiling (gain) while the driver steers.
+    const bool angle_violation = steer_angle_cmd_checks_vm(desired_angle, steer_control_enabled, HYUNDAI_CANFD_ANGLE_LIMITS,
+                                                           HYUNDAI_CANFD_ANGLE_PARAMS) ||
                                  safety_max_limit_check(desired_angle, HYUNDAI_CANFD_ANGLE_LIMITS.max_angle,
                                                        -HYUNDAI_CANFD_ANGLE_LIMITS.max_angle);
     const bool measured_error = steer_control_enabled &&
                                 safety_max_limit_check(desired_angle, safety.angle_meas.max + 100, safety.angle_meas.min - 100);
-    const bool frequency_violation = rt_angle_rate_limit_check(HYUNDAI_CANFD_ANGLE_LIMITS);
+    // While steering, steer_angle_cmd_checks_vm already counts this frame for the real time rate limit.
+    bool frequency_violation = false;
+    if (!vm_rt_checked) {
+      frequency_violation = rt_angle_rate_limit_check(HYUNDAI_CANFD_ANGLE_LIMITS);
+    }
     const bool checksum_violation = hyundai_canfd_get_checksum(msg) != hyundai_common_canfd_compute_checksum(msg);
     const bool counter_violation = safety.hyundai_angle_tx_counter_valid &&
                                    (counter != ((safety.hyundai_angle_tx_counter + 1U) & 0xFFU));
-    if (state_violation || active_angle_violation || driver_override || lateral_mdps_fault || angle_violation || measured_error ||
+    if (state_violation || lateral_mdps_fault || angle_violation || measured_error ||
         frequency_violation || checksum_violation || counter_violation || !stock_payload_matches) {
       tx = false;
       // Protocol, measurement, and frequency failures happen outside the

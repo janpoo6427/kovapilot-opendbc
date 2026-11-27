@@ -2,7 +2,11 @@
 from opendbc.testing import parameterized_class
 import unittest
 
+from opendbc.car.hyundai.carcontroller import HyundaiCanFDAngleParams
+from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import HyundaiSafetyFlags
+from opendbc.car.lateral import get_max_angle_delta_vm, get_max_angle_vm
+from opendbc.car.vehicle_model import VehicleModel
 from opendbc.car.structs import CarParams
 import opendbc.safety.tests.common as common
 from opendbc.safety.tests.hyundai_common import HyundaiAlwaysOnLateralBase, HyundaiButtonBase, HyundaiLongitudinalBase
@@ -261,16 +265,15 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
   LFA_BUTTON = True
 
   STEER_ANGLE_MAX = 175.0
-  STEER_ANGLE_TEST_MAX = 55.0
   DEG_TO_CAN = 10.0
-  ANGLE_RATE_BP = [0.0, 5.0, 25.0]
-  ANGLE_RATE_UP = [1.2, 0.8, 0.2]
-  ANGLE_RATE_DOWN = [1.5, 1.0, 0.3]
   LATERAL_FREQUENCY = 100
+  # speeds where the vehicle model jerk step stays inside the 10 degree measured error
+  VM_TEST_SPEEDS = (5.0, 8.0, 12.0, 20.0, 30.0, 40.0)
 
   def setUp(self):
     self.angle_counter = 0
     self.angle_frame = 0
+    self.VM = VehicleModel(CarInterface.get_non_essential_params("HYUNDAI_IONIQ_9"))
     super().setUp()
     self.stock_lfa = {
       "ADAS_ActvACILvl2Sta": 1,
@@ -333,6 +336,12 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
   def _speed_msg(self, speed, wheels=("FL", "FR", "RL", "RR")):
     values = {f"WHL_Spd{pos}Val": speed * 3.6 for pos in wheels}
     return self.packer.make_can_msg_safety("WHEEL_SPEEDS", self.PT_BUS, values)
+
+  def _set_vm_speed(self, speed):
+    # safety fudges the speed by -1 m/s; return the speed it uses, after wheel speed and sample rounding
+    kph = round((speed + 1.0) * 3.6 / 0.03125) * 0.03125
+    self._reset_speed_measurement(kph / 3.6)
+    return max(common.round_speed(kph / 3.6) - 1.0, 1.0)
 
   def _vehicle_moving_msg(self, speed):
     values = {f"WHL_Spd{pos}Val": speed * 0.03125 for pos in ("FL", "FR", "RL", "RR")}
@@ -445,12 +454,15 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     self.assertTrue(self._tx(self._angle_cmd_msg(0, True, counter=13)))
 
   def test_rejected_protocol_frame_does_not_advance_rate_state(self):
+    # at 25 m/s the vehicle model allows one 0.3 degree step per frame
+    speed = self._set_vm_speed(25.0)
+    step = int(get_max_angle_delta_vm(speed, self.VM, HyundaiCanFDAngleParams) * self.DEG_TO_CAN + 1) / self.DEG_TO_CAN
     self._reset_angle_measurement(0)
     self.safety.set_controls_allowed(True)
     self._set_prev_desired_angle(0)
-    self.assertFalse(self._tx(self._angle_cmd_msg(1.2, True, reserved=1)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(step, True, reserved=1)))
     self.safety.set_controls_allowed(True)
-    self.assertFalse(self._tx(self._angle_cmd_msg(2.4, True)))
+    self.assertFalse(self._tx(self._angle_cmd_msg(2 * step, True)))
 
   def test_angle_measured_error(self):
     self._reset_angle_measurement(0)
@@ -461,13 +473,15 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     self._set_prev_desired_angle(10.1)
     self.assertFalse(self._tx(self._angle_cmd_msg(10.1, True)))
 
-  def test_driver_override_blocks_active_angle(self):
-    self._reset_angle_measurement(0)
-    self._rx(self._angle_meas_msg(0, MDPS_StrTqSnsrVal=251))
-    self.safety.set_controls_allowed(True)
-    self._set_prev_desired_angle(0)
-    self.assertFalse(self._tx(self._angle_cmd_msg(0, True)))
-    self.assertTrue(self._tx(self._angle_cmd_msg(0, False)))
+  def test_driver_torque_does_not_block_active_angle(self):
+    # the controller lowers the MDPS torque ceiling instead of releasing; panda has no driver torque check
+    for torque in (251, 600, -251, -600):
+      self._reset_angle_measurement(0)
+      self._rx(self._angle_meas_msg(0, MDPS_StrTqSnsrVal=torque))
+      self.safety.set_controls_allowed(True)
+      self._set_prev_desired_angle(0)
+      self.assertTrue(self._tx(self._angle_cmd_msg(0, True)))
+      self.assertTrue(self._tx(self._angle_cmd_msg(0, False)))
 
   def test_camera_mdps_mirror_contract(self):
     self._reset_angle_measurement(0)
@@ -525,13 +539,56 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     self.assertFalse(self._tx(self._camera_mdps_msg(1, {"COUNTER": 21}, previous)))
     self.assertTrue(self._tx(self._camera_mdps_msg(1, {"COUNTER": 22}, newest)))
 
-  def test_active_angle_requires_measured_angle_inside_sixty_degrees(self):
-    for measured, desired in ((60.0, 59.0), (65.0, 60.0), (-60.0, -59.0), (-65.0, -60.0)):
-      self._reset_angle_measurement(measured)
+  def test_active_angle_allowed_at_high_measured_angle(self):
+    for sign in (1, -1):
+      for measured, desired in ((60.0, 59.0), (65.0, 60.0), (120.0, 125.0), (175.0, 170.0), (175.0, 175.0)):
+        self._reset_angle_measurement(sign * measured)
+        self.safety.set_controls_allowed(True)
+        self._set_prev_desired_angle(sign * desired)
+        self.assertTrue(self._tx(self._angle_cmd_msg(sign * desired, True)))
+        self.assertTrue(self._tx(self._angle_cmd_msg(sign * measured, False)))
+
+  def test_active_angle_absolute_limit(self):
+    # at low speed the vehicle model allows more than 175 degrees; the absolute limit still holds
+    for sign in (1, -1):
+      self._reset_angle_measurement(sign * 175.0)
       self.safety.set_controls_allowed(True)
-      self._set_prev_desired_angle(desired)
-      self.assertFalse(self._tx(self._angle_cmd_msg(desired, True)))
-      self.assertTrue(self._tx(self._angle_cmd_msg(measured, False)))
+      self._set_prev_desired_angle(sign * 175.0)
+      self.assertTrue(self._tx(self._angle_cmd_msg(sign * 175.0, True)))
+      self.assertFalse(self._tx(self._angle_cmd_msg(sign * 175.1, True)))
+
+  def test_angle_cmd_when_enabled(self):
+    # the speed table is replaced by the vehicle model limits, see test_lateral_accel_limit and test_lateral_jerk_limit
+    pass
+
+  def test_lateral_accel_limit(self):
+    for speed in self.VM_TEST_SPEEDS:
+      vm_speed = self._set_vm_speed(speed)
+      max_angle_can = int(get_max_angle_vm(vm_speed, self.VM, HyundaiCanFDAngleParams) * self.DEG_TO_CAN + 1)
+      limit_can = min(max_angle_can, int(self.STEER_ANGLE_MAX * self.DEG_TO_CAN))
+      for sign in (1, -1):
+        for angle_can, should_tx in ((limit_can, True), (limit_can + 1, False)):
+          angle = sign * angle_can / self.DEG_TO_CAN
+          self._reset_angle_measurement(angle)
+          self.safety.set_controls_allowed(True)
+          self._set_prev_desired_angle(angle)
+          self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(angle, True)), (speed, angle))
+
+  def test_lateral_jerk_limit(self):
+    for speed in self.VM_TEST_SPEEDS:
+      vm_speed = self._set_vm_speed(speed)
+      delta_can = int(get_max_angle_delta_vm(vm_speed, self.VM, HyundaiCanFDAngleParams) * self.DEG_TO_CAN + 1)
+      self.assertLess(delta_can, 100)
+      # start inside the lateral accel limit
+      start_max = min(30.0, round(get_max_angle_vm(vm_speed, self.VM, HyundaiCanFDAngleParams) / 2.0))
+      for start in (0.0, start_max, -start_max):
+        for sign in (1, -1):
+          for step_can, should_tx in ((delta_can, True), (delta_can + 1, False)):
+            self._reset_angle_measurement(start)
+            self.safety.set_controls_allowed(True)
+            self._set_prev_desired_angle(start)
+            angle = start + sign * step_can / self.DEG_TO_CAN
+            self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(angle, True)), (speed, start, angle))
 
   def test_inactive_high_angle_clamps_to_command_limit(self):
     for measured, commanded in ((300.0, self.STEER_ANGLE_MAX), (-300.0, -self.STEER_ANGLE_MAX)):
@@ -553,7 +610,7 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
 
           self.safety.set_controls_allowed(controls_allowed)
           self._set_prev_desired_angle(angle_cmd)
-          should_tx = controls_allowed and abs(angle_meas) < 60 and abs(angle_cmd) <= 60 and abs(angle_cmd - angle_meas) <= 10
+          should_tx = controls_allowed and abs(angle_cmd - angle_meas) <= 10
           self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(angle_cmd, True)))
 
   def test_mdps_invalid_and_fault_clear_controls(self):
