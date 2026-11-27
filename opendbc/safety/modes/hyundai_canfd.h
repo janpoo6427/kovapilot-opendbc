@@ -248,8 +248,9 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
     .frequency = 100U,
   };
 
-  // IONIQ 9 (the only CAN-FD angle platform): slip factor from calc_slip_factor() with the IONIQ 9
-  // CarParams, steer ratio and wheelbase from its CarSpecs. sunnypilot uses the same IONIQ 9 values.
+  // Used for every CAN-FD angle steering car. The values come from the first car measured with this mode
+  // (IONIQ 9): slip factor from calc_slip_factor() with its CarParams, steer ratio and wheelbase from its
+  // CarSpecs. sunnypilot uses the same values.
   const AngleSteeringParams HYUNDAI_CANFD_ANGLE_PARAMS = {
     .slip_factor = -0.0005358728290930592f,
     .steer_ratio = 16.02f,

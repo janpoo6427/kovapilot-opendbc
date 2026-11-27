@@ -216,13 +216,6 @@ class HyundaiCanFDMessageRequirement:
 
 
 @dataclass(frozen=True)
-class HyundaiFirmwareRequirement:
-  ecu: CarParams.Ecu
-  address: int
-  version: bytes
-
-
-@dataclass(frozen=True)
 class HyundaiCanFDSteeringConfig:
   api: HyundaiCanFDSteeringApi = HyundaiCanFDSteeringApi.TORQUE_AUTO
   command_address: int | None = None
@@ -231,7 +224,6 @@ class HyundaiCanFDSteeringConfig:
   command_bus: HyundaiCanFDBusRole | None = None
   measured_angle_signal: str | None = None
   required_messages: tuple[HyundaiCanFDMessageRequirement, ...] = ()
-  required_firmware: tuple[HyundaiFirmwareRequirement, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -245,7 +237,6 @@ class HyundaiCanFDLongitudinalConfig:
   ecu_disable_strategy: HyundaiCanFDEcuDisableStrategy = HyundaiCanFDEcuDisableStrategy.UNCONFIGURED
   stock_aeb_fcw_status: HyundaiCanFDStockSafetyStatus = HyundaiCanFDStockSafetyStatus.UNVERIFIED
   required_messages: tuple[HyundaiCanFDMessageRequirement, ...] = ()
-  required_firmware: tuple[HyundaiFirmwareRequirement, ...] = ()
 
   def __post_init__(self):
     command_fields = (self.stock_scc_bus, self.command_bus, self.command_address, self.command_dlc, self.command_frequency_hz)
@@ -260,7 +251,7 @@ class HyundaiCanFDLongitudinalConfig:
         raise ValueError("configured CAN-FD longitudinal profiles require an ECU disable strategy")
       if self.command_dlc <= 0 or self.command_frequency_hz <= 0:
         raise ValueError("configured CAN-FD longitudinal profiles require positive DLC and frequency")
-      if not self.required_messages or not self.required_firmware:
+      if not self.required_messages:
         raise ValueError("configured CAN-FD longitudinal profiles require passive evidence")
 
   @property
@@ -271,11 +262,61 @@ class HyundaiCanFDLongitudinalConfig:
 @dataclass
 class HyundaiCanFDPlatformConfig(PlatformConfig):
   dbc_dict: DbcDict = field(default_factory=lambda: {Bus.pt: "hyundai_canfd_generated"})
-  steering_config: HyundaiCanFDSteeringConfig = field(default_factory=HyundaiCanFDSteeringConfig)
-  longitudinal_config: HyundaiCanFDLongitudinalConfig = field(default_factory=HyundaiCanFDLongitudinalConfig)
 
   def init(self):
     self.flags |= HyundaiFlags.CANFD
+
+
+# CAN-FD angle steering is chosen from the messages a car sends (bus, address and length), not from its
+# platform or firmware versions. The camera sends the stock angle command LFA_ALT (0xCB) and SCC_CONTROL
+# (0x1A0) on the camera bus; the ECAN carries the EV accelerator (0x35), cruise buttons (0x1CF), MDPS (0xEA)
+# and the other frames that panda safety checks in its angle steering mode.
+CANFD_ANGLE_STEERING_PROFILE = HyundaiCanFDSteeringConfig(
+  api=HyundaiCanFDSteeringApi.ANGLE_LFA_ALT,
+  command_address=0xCB,
+  command_dlc=24,
+  stock_bus=HyundaiCanFDBusRole.CAM,
+  command_bus=HyundaiCanFDBusRole.ECAN,
+  measured_angle_signal="MDPS_EstStrAnglVal",
+  required_messages=(
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0xCB, 24),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x1A0, 32),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x35, 32),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xA0, 24),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x125, 16),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x175, 24),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x1CF, 8),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xEA, 24),
+  ),
+)
+
+# openpilot longitudinal on CAN-FD angle steering cars, also chosen from the messages a car sends.
+CANFD_ANGLE_LONGITUDINAL_PROFILE = HyundaiCanFDLongitudinalConfig(
+  # The physical harness is connected at the ADAS module, while passive
+  # evidence shows stock SCC_CONTROL arriving on CAM and replacement
+  # SCC_CONTROL being transmitted on ECAN. The two facts are independent.
+  harness_connection=HyundaiCanFDHarnessConnection.ADAS,
+  stock_scc_bus=HyundaiCanFDBusRole.CAM,
+  command_bus=HyundaiCanFDBusRole.ECAN,
+  command_address=0x1A0,
+  command_dlc=32,
+  command_frequency_hz=50,
+  # The known-good route does not disable 0x730 or 0x7D0 (same as carrot's
+  # camera-SCC mode): only SCC_CONTROL is replaced, so the stock camera/ADAS
+  # ECUs keep running. Whether stock AEB/FCW still act while openpilot owns
+  # longitudinal has NOT been verified on the car, so the status stays
+  # UNVERIFIED. It no longer blocks the opt-in alpha longitudinal choice.
+  ecu_disable_strategy=HyundaiCanFDEcuDisableStrategy.NONE,
+  stock_aeb_fcw_status=HyundaiCanFDStockSafetyStatus.UNVERIFIED,
+  required_messages=(
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x1A0, 32),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x12A, 16),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x35, 32),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xA0, 24),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x175, 24),
+    HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x1CF, 8),
+  ),
+)
 
 
 class CAR(Platforms):
@@ -480,60 +521,6 @@ class CAR(Platforms):
     [HyundaiCarDocs("Hyundai Ioniq 9 2025", "All", car_parts=CarParts.common([CarHarness.hyundai_m]))],
     CarSpecs(wheelbase=3.13, steerRatio=16.02),
     flags=HyundaiFlags.EV,
-    steering_config=HyundaiCanFDSteeringConfig(
-      api=HyundaiCanFDSteeringApi.ANGLE_LFA_ALT,
-      command_address=0xCB,
-      command_dlc=24,
-      stock_bus=HyundaiCanFDBusRole.CAM,
-      command_bus=HyundaiCanFDBusRole.ECAN,
-      measured_angle_signal="MDPS_EstStrAnglVal",
-      required_messages=(
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0xCB, 24),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x1A0, 32),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x35, 32),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xA0, 24),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x125, 16),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x175, 24),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x1CF, 8),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xEA, 24),
-      ),
-      required_firmware=(
-        HyundaiFirmwareRequirement(Ecu.fwdRadar, 0x7D0, b'\xf1\x00MEev RDR -----      1.00 1.00 99110-GO000         '),
-        HyundaiFirmwareRequirement(Ecu.fwdCamera, 0x7C4, b'\xf1\x00ME  MFC  AT KOR LHD 1.00 1.01 99211-GO000 250103'),
-        HyundaiFirmwareRequirement(Ecu.adas, 0x730, b'\xf1\x00ME  FBL5 1.00 1.01 250122'),
-      ),
-    ),
-    longitudinal_config=HyundaiCanFDLongitudinalConfig(
-      # The physical harness is connected at the ADAS module, while passive
-      # evidence shows stock SCC_CONTROL arriving on CAM and replacement
-      # SCC_CONTROL being transmitted on ECAN. The two facts are independent.
-      harness_connection=HyundaiCanFDHarnessConnection.ADAS,
-      stock_scc_bus=HyundaiCanFDBusRole.CAM,
-      command_bus=HyundaiCanFDBusRole.ECAN,
-      command_address=0x1A0,
-      command_dlc=32,
-      command_frequency_hz=50,
-      # The known-good route does not disable 0x730 or 0x7D0 (same as carrot's
-      # camera-SCC mode): only SCC_CONTROL is replaced, so the stock camera/ADAS
-      # ECUs keep running. Whether stock AEB/FCW still act while openpilot owns
-      # longitudinal has NOT been verified on the car, so the status stays
-      # UNVERIFIED. It no longer blocks the opt-in alpha longitudinal choice.
-      ecu_disable_strategy=HyundaiCanFDEcuDisableStrategy.NONE,
-      stock_aeb_fcw_status=HyundaiCanFDStockSafetyStatus.UNVERIFIED,
-      required_messages=(
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x1A0, 32),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.CAM, 0x12A, 16),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x35, 32),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0xA0, 24),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x175, 24),
-        HyundaiCanFDMessageRequirement(HyundaiCanFDBusRole.ECAN, 0x1CF, 8),
-      ),
-      required_firmware=(
-        HyundaiFirmwareRequirement(Ecu.fwdRadar, 0x7D0, b'\xf1\x00MEev RDR -----      1.00 1.00 99110-GO000         '),
-        HyundaiFirmwareRequirement(Ecu.fwdCamera, 0x7C4, b'\xf1\x00ME  MFC  AT KOR LHD 1.00 1.01 99211-GO000 250103'),
-        HyundaiFirmwareRequirement(Ecu.adas, 0x730, b'\xf1\x00ME  FBL5 1.00 1.01 250122'),
-      ),
-    ),
   )
   HYUNDAI_TUCSON_4TH_GEN = HyundaiCanFDPlatformConfig(
     [

@@ -1,9 +1,7 @@
-from typing import cast
-
 from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import (CAR, DBC, HyundaiCanFDEcuDisableStrategy, HyundaiCanFDPlatformConfig,
-                                       HyundaiCanFDSteeringApi, HyundaiFlags, HyundaiSafetyFlags)
+from opendbc.car.hyundai.values import (CANFD_ANGLE_LONGITUDINAL_PROFILE, CANFD_ANGLE_STEERING_PROFILE, CAR, DBC,
+                                       HyundaiCanFDEcuDisableStrategy, HyundaiFlags, HyundaiSafetyFlags)
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
@@ -19,8 +17,8 @@ ENABLE_BUTTONS = (ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.can
 
 # Source-level staging gates for capability-qualified CAN-FD angle and
 # longitudinal control. These deliberately are not Params: changing either
-# requires review and a new build. Exact passive topology and firmware matching
-# are still required below, and release builds remain fail-closed for lateral.
+# requires review and a new build. The passive message topology is still
+# required below, and release builds remain fail-closed for lateral.
 # Longitudinal is only offered (alphaLongitudinalAvailable); it stays inactive
 # until the user enables the existing alpha longitudinal preference.
 ENABLE_CANFD_LATERAL_STAGING = True
@@ -37,11 +35,9 @@ class CarInterface(CarInterfaceBase):
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
     ret.brand = "hyundai"
-    platform = CAR(candidate)
 
     if ret.flags & HyundaiFlags.CANFD:
       # Shared configuration for CAN-FD cars
-      canfd_config = cast(HyundaiCanFDPlatformConfig, platform.config)
 
       # "LKA steering" if LKAS or LKAS_ALT messages are seen coming from the camera.
       # Generally means our LKAS message is forwarded to another ECU (commonly ADAS ECU)
@@ -51,26 +47,20 @@ class CarInterface(CarInterfaceBase):
       lka_steering = 0x50 in fingerprint[cam_can] or 0x110 in fingerprint[cam_can]
       CAN = CanBus(None, fingerprint, lka_steering)
 
-      steering_config = canfd_config.steering_config
-      longitudinal_config = canfd_config.longitudinal_config
-      observed_firmware = {(fw.ecu.raw, fw.address, bytes(fw.fwVersion)) for fw in car_fw}
-
-      def capability_matches(required_messages, required_firmware):
-        topology_matches = all(
+      def messages_match(required_messages):
+        return all(
           fingerprint[getattr(CAN, requirement.role.value)].get(requirement.address) == requirement.dlc
           for requirement in required_messages
         )
-        firmware_matches = all(
-          (requirement.ecu, requirement.address, requirement.version) in observed_firmware
-          for requirement in required_firmware
-        )
-        return topology_matches and firmware_matches
 
-      angle_steering = steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT
-      if angle_steering and capability_matches(steering_config.required_messages, steering_config.required_firmware):
+      # Angle steering, and openpilot longitudinal on angle steering cars, follow the messages the car
+      # sends (bus, address and length), not the platform or its firmware versions. panda safety's angle
+      # steering mode does not accept LKA steering message cars.
+      if not lka_steering and messages_match(CANFD_ANGLE_STEERING_PROFILE.required_messages):
         ret.flags |= HyundaiFlags.CANFD_ANGLE_STEERING.value
-      if longitudinal_config.configured and capability_matches(longitudinal_config.required_messages, longitudinal_config.required_firmware):
-        ret.flags |= HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE.value
+        longitudinal_profile = CANFD_ANGLE_LONGITUDINAL_PROFILE
+        if longitudinal_profile.configured and messages_match(longitudinal_profile.required_messages):
+          ret.flags |= HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE.value
 
       ret.alphaLongitudinalAvailable = not (ret.flags & HyundaiFlags.CANFD_NO_RADAR_DISABLE)
       if lka_steering and Ecu.adas not in [fw.ecu for fw in car_fw]:
@@ -193,21 +183,18 @@ class CarInterface(CarInterfaceBase):
       ret.dashcamOnly = True
 
     if ret.flags & HyundaiFlags.CANFD:
-      canfd_config = cast(HyundaiCanFDPlatformConfig, platform.config)
-      # Angle-command CAN-FD profiles require the exact firmware and passive
-      # topology checks above. Longitudinal additionally needs the source-level
-      # gate and a profile that keeps the stock SCC/ADAS ECUs running (no ECU
-      # disable), as carrot's camera-SCC mode does. Stock AEB/FCW preservation
-      # is NOT verified on the car (stock_aeb_fcw_status stays UNVERIFIED); it
-      # is no longer an availability gate, and the user must still opt in.
-      if canfd_config.steering_config.api == HyundaiCanFDSteeringApi.ANGLE_LFA_ALT:
-        lateral_staging_enabled = (ENABLE_CANFD_LATERAL_STAGING and not is_release and
-                                   bool(ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING))
-        longitudinal_config = canfd_config.longitudinal_config
+      # CAN-FD angle steering cars need the passive message topology checks above.
+      # Longitudinal additionally needs the source-level gate and a profile that
+      # keeps the stock SCC/ADAS ECUs running (no ECU disable), as carrot's
+      # camera-SCC mode does. Stock AEB/FCW preservation is NOT verified on the
+      # car (stock_aeb_fcw_status stays UNVERIFIED); it is no longer an
+      # availability gate, and the user must still opt in.
+      if ret.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+        lateral_staging_enabled = ENABLE_CANFD_LATERAL_STAGING and not is_release
         ret.alphaLongitudinalAvailable = (
           ENABLE_CANFD_LONGITUDINAL_STAGING and lateral_staging_enabled and not ret.dashcamOnly and
           bool(ret.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE) and
-          longitudinal_config.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE
+          CANFD_ANGLE_LONGITUDINAL_PROFILE.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE
         )
         ret.openpilotLongitudinalControl = ret.alphaLongitudinalAvailable and alpha_long
         ret.pcmCruise = not ret.openpilotLongitudinalControl
@@ -230,8 +217,7 @@ class CarInterface(CarInterfaceBase):
 
     keep_stock_scc_ecu = bool(CP.flags & (HyundaiFlags.CANFD_CAMERA_SCC | HyundaiFlags.CAMERA_SCC))
     if CP.openpilotLongitudinalControl and CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE:
-      config = cast(HyundaiCanFDPlatformConfig, CAR(CP.carFingerprint).config).longitudinal_config
-      keep_stock_scc_ecu |= config.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE
+      keep_stock_scc_ecu |= CANFD_ANGLE_LONGITUDINAL_PROFILE.ecu_disable_strategy is HyundaiCanFDEcuDisableStrategy.NONE
     if CP.openpilotLongitudinalControl and not keep_stock_scc_ecu:
       addr, bus = 0x7d0, CanBus(CP).ECAN if CP.flags & HyundaiFlags.CANFD else 0
       if CP.flags & HyundaiFlags.CANFD_LKA_STEER_MSG.value:
