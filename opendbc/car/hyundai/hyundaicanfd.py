@@ -102,16 +102,21 @@ CCNC_HANDS_ON_ALERTS = (1, 2)
 CCNC_LFA_ICON_ACTIVE = 2
 
 
-def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False):
-  # Copy of the stock camera frame with only the hands-on warning and its chime removed, and the LFA icon
-  # shown green while openpilot steers. Every other signal, including the stock COUNTER, is copied verbatim;
-  # the packer recomputes the checksum.
+def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_hands_on=True, set_speed=None):
+  # Copy of the stock camera frame with only the hands-on warning and its chime removed, the LFA icon
+  # shown green while openpilot steers, and, with openpilot longitudinal engaged, the cluster set speed
+  # (SETSPEED_SPEED) replaced by the openpilot set speed in display units, packed like SCC_CONTROL VSetDis.
+  # The stock camera keeps its own set speed there (CAN-FD angle steering car, rlog 0000079c 2026-11-27: cluster
+  # 30 km/h while openpilot and SCC_CONTROL VSetDis were 40 km/h). Every other signal, including the stock COUNTER
+  # and the SETSPEED icon state, is copied verbatim; the packer recomputes the checksum.
   values = dict(ccnc)
-  if values.get("ALERTS_2") in CCNC_HANDS_ON_ALERTS:
+  if clear_hands_on and values.get("ALERTS_2") in CCNC_HANDS_ON_ALERTS:
     values["ALERTS_2"] = 0
     values["SOUNDS_2"] = 0
   if lateral_active:
     values["LFA_ICON"] = CCNC_LFA_ICON_ACTIVE
+  if set_speed is not None:
+    values["SETSPEED_SPEED"] = set_speed
   return packer.make_can_msg("CCNC_0x161", CAN.ECAN, values)
 
 
