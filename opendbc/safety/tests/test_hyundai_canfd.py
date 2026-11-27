@@ -34,7 +34,7 @@ ALL_GAS_EV_HYBRID_COMBOS = [
 
 class HyundaiCanfdPedalResumeBase(HyundaiLongitudinalBase):
   """
-    ALT_EXP_PEDAL_RESUME: the driver's brake or accelerator release re-allows controls while
+    ALT_EXP_PEDAL_RESUME: the driver's brake release or accelerator press re-allows controls while
     TCS reports cruise available (ACCEnable 0) and no CANCEL was pressed since the last SET/RES.
     Brake, CANCEL and cruise unavailable still exit controls. Needs openpilot longitudinal.
   """
@@ -76,15 +76,50 @@ class HyundaiCanfdPedalResumeBase(HyundaiLongitudinalBase):
       self._brake_tap()
       self.assertTrue(self.safety.get_controls_allowed())
 
-  def test_pedal_resume_gas_release(self):
+  def test_pedal_resume_gas_press(self):
+    # the accelerator allows controls the moment it is pressed, and stays allowed while held and after release
     for moving in (False, True):
       self._pedal_resume()
       self._rx(self._moving_msg(moving))
       self._rx(self._tcs_msg(0))
-      self._rx(self._user_gas_msg(1))
+      self._rx(self._user_gas_msg(0))
       self.assertFalse(self.safety.get_controls_allowed())
+      self._rx(self._user_gas_msg(1))
+      self.assertTrue(self.safety.get_controls_allowed())
+      for _ in range(10):
+        self._rx(self._user_gas_msg(1))
+      self.assertTrue(self.safety.get_controls_allowed())
       self._rx(self._user_gas_msg(0))
       self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_gas_release_does_not_allow(self):
+    # releasing the accelerator is not a resume moment
+    self._rx(self._tcs_msg(0))
+    self._rx(self._user_gas_msg(1))
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.safety.set_controls_allowed(False)
+    for _ in range(10):
+      self._rx(self._user_gas_msg(1))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._rx(self._user_gas_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+    for _ in range(10):
+      self._rx(self._user_gas_msg(0))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_gas_press_after_brake_release(self):
+    # brake released (allowed), then controls cleared, then the accelerator press allows again
+    self._rx(self._moving_msg(True))
+    self._brake_tap()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self.safety.set_controls_allowed(False)
+    self._rx(self._user_gas_msg(1))
+    self.assertTrue(self.safety.get_controls_allowed())
+    # a brake press while the accelerator is held still exits at once
+    self._rx(self._tcs_msg(1))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._rx(self._user_gas_msg(1))
+    self.assertFalse(self.safety.get_controls_allowed())
 
   def test_pedal_resume_needs_release(self):
     self._rx(self._tcs_msg(0))
