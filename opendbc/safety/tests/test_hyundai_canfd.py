@@ -934,8 +934,12 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     self._always_on()
     self._engage_without_cruise()
     self.assertEqual(self._ccnc_cycles(1, 5)[1:], [(False, True)] * 4)
+    # braking keeps always-on lateral, and with it the copy
     self._rx(self._user_brake_msg(True))
-    self.assertEqual(self._ccnc_cycles(6, 3), [(True, False)] * 3)
+    self.assertEqual(self._ccnc_cycles(6, 3), [(False, True)] * 3)
+    # without lateral control (standstill) stock goes out again
+    self._rx(self._moving_msg(False))
+    self.assertEqual(self._ccnc_cycles(9, 3), [(True, False)] * 3)
 
   def test_ccnc_stale_copy_forwards_stock(self):
     max_age = 150000

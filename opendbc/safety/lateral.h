@@ -10,9 +10,10 @@ static bool always_on_lateral_enabled(void) {
 }
 
 // Lateral control is allowed with controls_allowed, or with always-on lateral after a driver
-// engagement while the car moves, the brake is released and the RX checks are valid.
+// engagement while the car moves and the RX checks are valid. Braking exits controls_allowed
+// (longitudinal) but keeps always-on lateral, so steering does not drop while the driver brakes.
 static bool lateral_controls_allowed(void) {
-  const bool always_on_allowed = always_on_lateral_enabled() && safety.lateral_engaged && !safety.brake_pressed &&
+  const bool always_on_allowed = always_on_lateral_enabled() && safety.lateral_engaged &&
                                  safety.vehicle_moving && !safety.safety_rx_checks_invalid;
   return safety.controls_allowed || always_on_allowed;
 }

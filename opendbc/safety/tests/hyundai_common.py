@@ -81,8 +81,8 @@ class HyundaiButtonBase(common.CarSafetyTest):
 class HyundaiAlwaysOnLateralBase(common.CarSafetyTest):
   """
     ALT_EXP_ALWAYS_ON_LATERAL: after a driver engagement (cruise, or the LFA button where the
-    safety mode reads it), lateral commands stay allowed without cruise while the car moves,
-    the brake is released and the RX checks are valid.
+    safety mode reads it), lateral commands stay allowed without cruise while the car moves
+    and the RX checks are valid, also while the driver brakes (the brake still exits controls).
   """
   LFA_BUTTON = False  # the safety mode reads the LFA button as an engagement
 
@@ -147,14 +147,39 @@ class HyundaiAlwaysOnLateralBase(common.CarSafetyTest):
     self._cruise_disengage()
     self.assertTrue(self._lateral_cmd_allowed())
 
-  def test_always_on_lateral_blocked_while_braking(self):
+  def test_always_on_lateral_stays_while_braking(self):
     self._always_on()
     self._engage_without_cruise()
     self._rx(self._user_brake_msg(True))
-    self.assertFalse(self._lateral_cmd_allowed())
+    self.assertTrue(self._lateral_cmd_allowed())
     self.assertTrue(self.safety.get_lateral_engaged())
+    self.assertFalse(self.safety.get_controls_allowed())
     self._rx(self._user_brake_msg(False))
     self.assertTrue(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_brake_exits_cruise_keeps_lateral(self):
+    self._always_on()
+    self._cruise_engage()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self.safety.get_longitudinal_allowed())
+    self.assertTrue(self._lateral_cmd_allowed())
+    # braking to a stop still blocks lateral at standstill
+    self._rx(self._moving_msg(False))
+    self.assertFalse(self._lateral_cmd_allowed())
+    self._rx(self._moving_msg(True))
+    self.assertTrue(self._lateral_cmd_allowed())
+
+  def test_always_on_lateral_off_blocked_while_braking(self):
+    self._always_on(False)
+    self._cruise_engage()
+    self.assertTrue(self._lateral_cmd_allowed())
+    self._rx(self._user_brake_msg(True))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self.assertFalse(self._lateral_cmd_allowed())
+    self._rx(self._user_brake_msg(False))
+    self.assertFalse(self._lateral_cmd_allowed())
 
   def test_always_on_lateral_blocked_at_standstill(self):
     self._always_on()

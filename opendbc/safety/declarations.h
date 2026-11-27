@@ -253,8 +253,8 @@ void safety_heartbeat(bool engaged);
 void safety_heartbeat_check(void);
 void safety_alternative_experience(int alt_exp);
 
-// Always-on lateral: once the driver engages, lateral control may outlive cruise.
-// It is still blocked while braking, at standstill, and on RX faults (see lateral_controls_allowed).
+// Always-on lateral: once the driver engages, lateral control may outlive cruise and stays
+// allowed while braking. It is still blocked at standstill and on RX faults (see lateral_controls_allowed).
 #define ALT_EXP_ALWAYS_ON_LATERAL 1024U
 
 // Pedal resume (Hyundai CAN FD with openpilot longitudinal): the driver releasing the brake or the
