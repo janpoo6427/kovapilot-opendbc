@@ -226,6 +226,7 @@ struct CarState {
   leftBlindspot @33 :Bool;  # Is there something blocking the left lane change
   rightBlindspot @34 :Bool; # Is there something blocking the right lane change
   blindspotFresh @62 :Bool; # KOVA: the blindspot frame arrived recently (false: no BSM or its frame stopped, values are stale)
+  pcmCruiseGap @63 :UInt8; # KOVA: the car's own cruise gap level from the stock SCC frame (1 = closest), 0 = unknown or stock SCC off
 
   fuelGauge @41 :Float32; # battery or fuel tank level from [0.0, 1.0]
   charging @43 :Bool;

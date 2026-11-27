@@ -296,6 +296,13 @@ class CarState(CarStateBase):
       ret.cruiseState.speed = cp_cruise_info.vl["SCC_CONTROL"]["VSetDis"] * speed_factor
       self.cruise_info = copy.copy(cp_cruise_info.vl["SCC_CONTROL"])
 
+    # The car's own cruise gap level (1 = closest, 0 = stock SCC off). Read only where this SCC_CONTROL frame is
+    # already parsed above, so CAN validity is unchanged. CAN-FD camera SCC, rlog 0000079c segment 49 (2026-11-27):
+    # every gap button press stepped the camera SCC_CONTROL DISTANCE_SETTING 4 -> 3 -> 2 -> 1 -> 4, also while
+    # openpilot longitudinal was engaged, and CCNC_0x161 DISTANCE (the cluster) followed it.
+    if self.CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE or not self.CP.openpilotLongitudinalControl:
+      ret.pcmCruiseGap = int(cp_cruise_info.vl["SCC_CONTROL"]["DISTANCE_SETTING"])
+
     # Manual Speed Limit Assist is a feature that replaces non-adaptive cruise control on EV CAN FD platforms.
     # It limits the vehicle speed, overridable by pressing the accelerator past a certain point.
     # The car will brake, but does not respect positive acceleration commands in this mode
