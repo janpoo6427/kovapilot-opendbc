@@ -26,13 +26,19 @@ MAX_ANGLE_CONSECUTIVE_FRAMES = 2
 # and triggers the "SCC Conditions Not Met" alert. Delaying the button send lets factory SCC disengage
 # naturally on brake press. We send ~100 ms later if it fails to do so, or if we want to cancel for another reason.
 CANCEL_BUTTON_DELAY_FRAMES = 10
-ANGLE_ACTIVE_MEASURED_MAX = 60.0
-ANGLE_ACTIVE_COMMAND_MAX = 59.9
+# Active angle control holds the command at the 175 degree command limit instead of releasing.
+ANGLE_ACTIVE_COMMAND_MAX = CarControllerParams.ANGLE_LIMITS.STEER_ANGLE_MAX
 ANGLE_MAX_MEASURED_ERROR = 8.0
-ANGLE_DRIVER_TORQUE_LIMIT = 225.0
-ANGLE_DRIVER_TORQUE_RELEASE = 175.0
-ANGLE_DRIVER_TORQUE_RELEASE_FRAMES = 10
+# Only a driver who turns the wheel past the command limit plus the measured error ends active control.
+ANGLE_ACTIVE_MEASURED_MAX = ANGLE_ACTIVE_COMMAND_MAX + ANGLE_MAX_MEASURED_ERROR
 ANGLE_ENGAGE_GRACE_FRAMES = 50
+# Torque reduction gain recovery: floor to ceiling in 0.5 s, slower when the driver steers again soon
+ANGLE_GAIN_DOWN_RATE = 0.014  # per frame
+ANGLE_GAIN_RECOVERY_TIME = 0.5  # s
+ANGLE_GAIN_REPEAT_RECOVERY_TIME = (ANGLE_GAIN_RECOVERY_TIME, 1.0, 2.0, 3.0)  # s, by number of quick repeated interventions
+ANGLE_GAIN_INTERVENTION_FRAMES = 30  # steeringPressed this long counts as an intervention
+ANGLE_GAIN_REPEAT_WINDOW_FRAMES = 500  # an intervention within 5 s of a full recovery is a repeat
+ANGLE_GAIN_STEP = 0.004  # ADAS_ACIAnglTqRedcGainVal CAN resolution
 ANGLE_FILTER_RC_BP = (5.0, 10.0, 20.0)
 ANGLE_FILTER_RC_V = (0.2, 0.1, 0.0)
 # A CCNC_0x161 copy must reach panda before the next stock frame (50 ms); copies of older frames are not sent
@@ -55,28 +61,21 @@ def update_hyundai_angle_engage(lateral_authorized, engage_frames):
   return engage_frames >= ANGLE_ENGAGE_GRACE_FRAMES, engage_frames
 
 
-def update_hyundai_angle_handover(lat_active, steering_pressed, steering_torque, override_latched, release_frames):
-  if not lat_active:
-    return False, False, 0
-
-  if steering_pressed or abs(steering_torque) >= ANGLE_DRIVER_TORQUE_LIMIT:
-    return False, True, 0
-
-  if override_latched:
-    release_frames = release_frames + 1 if abs(steering_torque) <= ANGLE_DRIVER_TORQUE_RELEASE else 0
-    if release_frames < ANGLE_DRIVER_TORQUE_RELEASE_FRAMES:
-      return False, True, release_frames
-    override_latched = False
-    release_frames = 0
-
-  return True, override_latched, release_frames
+# The driver's torque never releases angle control. It lowers the MDPS torque ceiling
+# (ADAS_ACIAnglTqRedcGainVal) so the driver can overpower the MDPS, and the ceiling comes back after.
+# Torque reduction gain curve from sunnypilot hkg-angle-steering-2025 compute_torque_reduction_gain (MIT).
+# Recovery time from carrot 47b1d34 carcontroller.py (MIT), without its model uncertainty term.
+def get_hyundai_angle_gain_limits(v_ego):
+  ceiling = float(np.interp(v_ego, [0.5, 1.5], [1.0, 0.85]))
+  shelf = float(np.interp(v_ego, [2.0, 11.0], [0.45, 0.6]))
+  floor = float(np.interp(v_ego, [2.0, 22.0], [0.1, 0.3]))
+  return ceiling, shelf, floor
 
 
-def update_hyundai_angle_torque_reduction_gain(steering_torque, v_ego, authority_requested, gain_last):
+def update_hyundai_angle_torque_reduction_gain(steering_torque, v_ego, authority_requested, gain_last,
+                                               recovery_time=ANGLE_GAIN_RECOVERY_TIME):
+  ceiling, shelf, floor = get_hyundai_angle_gain_limits(v_ego)
   if authority_requested:
-    ceiling = float(np.interp(v_ego, [0.5, 1.5], [1.0, 0.85]))
-    shelf = float(np.interp(v_ego, [2.0, 11.0], [0.45, 0.6]))
-    floor = float(np.interp(v_ego, [2.0, 22.0], [0.1, 0.3]))
     torque_points = (
       float(np.interp(v_ego, [2.0, 11.0], [75.0, 125.0])),
       float(np.interp(v_ego, [2.0, 11.0], [125.0, 150.0])),
@@ -87,10 +86,57 @@ def update_hyundai_angle_torque_reduction_gain(steering_torque, v_ego, authority
   else:
     target = 0.0
 
-  # Yield authority faster than it is restored. Quantize to the 0.004 CAN
-  # signal step so the controller and panda evaluate the exact same value.
-  gain = float(np.clip(target, gain_last - 0.014, gain_last + 0.004))
-  return float(np.clip(round(gain / 0.004) * 0.004, 0.0, 1.0))
+  # Yield at a fixed rate, restore from floor to ceiling over the recovery time. The gain is kept
+  # unquantized so slow recoveries still move; quantize_hyundai_angle_gain() gives the sent value.
+  rate_up = (ceiling - floor) * DT_CTRL / recovery_time
+  gain = float(np.clip(target, gain_last - ANGLE_GAIN_DOWN_RATE, gain_last + rate_up))
+  return float(np.clip(gain, 0.0, 1.0))
+
+
+def quantize_hyundai_angle_gain(gain):
+  # The 0.004 CAN signal step, so the controller and panda evaluate the exact same value
+  return float(np.clip(round(gain / ANGLE_GAIN_STEP) * ANGLE_GAIN_STEP, 0.0, 1.0))
+
+
+class HyundaiAngleGainRecovery:
+  """Picks the gain recovery time. After an intervention (steeringPressed for 0.3 s) the gain recovers in
+  0.5 s. Each new intervention within 5 s of a full recovery slows the next recovery to 1, 2 and 3 s.
+  5 s at the ceiling without an intervention resets it to 0.5 s."""
+
+  def __init__(self):
+    self.reset()
+
+  def reset(self):
+    self.repeats = 0
+    self.pressed_frames = 0
+    self.recovering = False
+    self.recovered_frames = 0
+
+  def update(self, authority_requested, steering_pressed, gain, v_ego):
+    if not authority_requested:
+      self.reset()
+      return ANGLE_GAIN_RECOVERY_TIME
+
+    if steering_pressed:
+      self.recovering = True
+      self.pressed_frames += 1
+      if self.pressed_frames == ANGLE_GAIN_INTERVENTION_FRAMES:
+        if 0 < self.recovered_frames < ANGLE_GAIN_REPEAT_WINDOW_FRAMES:
+          self.repeats = min(self.repeats + 1, len(ANGLE_GAIN_REPEAT_RECOVERY_TIME) - 1)
+        self.recovered_frames = 0
+    else:
+      self.pressed_frames = 0
+      ceiling, _, _ = get_hyundai_angle_gain_limits(v_ego)
+      if self.recovering and gain >= ceiling - 1e-6:
+        self.recovering = False
+        self.recovered_frames = 1
+      elif self.recovered_frames > 0:
+        self.recovered_frames += 1
+        if self.recovered_frames >= ANGLE_GAIN_REPEAT_WINDOW_FRAMES:
+          self.recovered_frames = 0
+          self.repeats = 0
+
+    return ANGLE_GAIN_REPEAT_RECOVERY_TIME[self.repeats]
 
 
 def get_hyundai_steering_output_can(angle_steering, angle_active, angle_torque_reduction_gain, apply_torque):
@@ -100,7 +146,9 @@ def get_hyundai_steering_output_can(angle_steering, angle_active, angle_torque_r
 
 
 def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle, lat_active, authority_allowed, VM=None):
-  angle_active = lat_active and authority_allowed and abs(measured_angle) < ANGLE_ACTIVE_MEASURED_MAX
+  # At the command limit the command is held there, not released. Past 175 + 8 degrees measured the
+  # command can not stay inside both the limit and the measured error, so control becomes inactive.
+  angle_active = lat_active and authority_allowed and abs(measured_angle) <= ANGLE_ACTIVE_MEASURED_MAX
   if angle_active:
     requested_angle = float(np.clip(requested_angle, -ANGLE_ACTIVE_COMMAND_MAX, ANGLE_ACTIVE_COMMAND_MAX))
   if VM is not None:
@@ -111,6 +159,7 @@ def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measure
   if angle_active:
     apply_angle = float(np.clip(apply_angle, measured_angle - ANGLE_MAX_MEASURED_ERROR,
                                 measured_angle + ANGLE_MAX_MEASURED_ERROR))
+    apply_angle = float(np.clip(apply_angle, -ANGLE_ACTIVE_COMMAND_MAX, ANGLE_ACTIVE_COMMAND_MAX))
   return apply_angle, angle_active
 
 
@@ -153,9 +202,9 @@ class CarController(CarControllerBase):
     self.angle_filter = FirstOrderFilter(0.0, ANGLE_FILTER_RC_V[1], DT_CTRL)
     self.angle_vm = VehicleModel(CP)
     self.angle_torque_reduction_gain = 0.0
+    self.angle_gain = 0.0
+    self.angle_gain_recovery = HyundaiAngleGainRecovery()
     self.angle_active = False
-    self.angle_override_latched = False
-    self.angle_override_release_frames = 0
     self.angle_engage_frames = 0
     self.ccnc_161_nanos_last = 0
     self.always_on_lateral = bool(CP.alternativeExperience & ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL)
@@ -187,14 +236,13 @@ class CarController(CarControllerBase):
       lateral_authorized = hyundai_angle_lateral_authorized(CC.latActive, self.CP.openpilotLongitudinalControl,
                                                             CS.out.cruiseState.enabled, self.always_on_lateral)
       angle_engage_ready, self.angle_engage_frames = update_hyundai_angle_engage(lateral_authorized, self.angle_engage_frames)
-      authority_allowed, self.angle_override_latched, self.angle_override_release_frames = update_hyundai_angle_handover(
-        angle_engage_ready, CS.out.steeringPressed, CS.out.steeringTorque,
-        self.angle_override_latched, self.angle_override_release_frames,
+      # driver torque and steeringPressed only lower the torque ceiling, they do not release control
+      authority_allowed = angle_engage_ready
+      recovery_time = self.angle_gain_recovery.update(lateral_authorized, CS.out.steeringPressed, self.angle_gain, CS.out.vEgoRaw)
+      self.angle_gain = update_hyundai_angle_torque_reduction_gain(
+        CS.out.steeringTorque, CS.out.vEgoRaw, lateral_authorized, self.angle_gain, recovery_time,
       )
-      authority_requested = lateral_authorized and not self.angle_override_latched and not CS.out.steeringPressed
-      self.angle_torque_reduction_gain = update_hyundai_angle_torque_reduction_gain(
-        CS.out.steeringTorque, CS.out.vEgoRaw, authority_requested, self.angle_torque_reduction_gain,
-      )
+      self.angle_torque_reduction_gain = quantize_hyundai_angle_gain(self.angle_gain)
       if authority_allowed:
         self.angle_filter.update_alpha(float(np.interp(CS.out.vEgo, ANGLE_FILTER_RC_BP, ANGLE_FILTER_RC_V)))
         requested_angle = self.angle_filter.update(actuators.steeringAngleDeg)

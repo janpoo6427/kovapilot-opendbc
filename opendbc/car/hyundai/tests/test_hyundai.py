@@ -6,13 +6,13 @@ from unittest.mock import patch
 
 from opendbc.can import CANPacker
 from opendbc.car import Bus, gen_empty_fingerprint
-from opendbc.car.structs import CarParams
+from opendbc.car.structs import CarControl, CarParams, CarState as CarStateStruct
 from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
-from opendbc.car.hyundai.carcontroller import (hyundai_angle_lateral_authorized, ANGLE_DRIVER_TORQUE_LIMIT, ANGLE_DRIVER_TORQUE_RELEASE_FRAMES,
-                                                ANGLE_ENGAGE_GRACE_FRAMES, CarController, apply_hyundai_angle_limits,
-                                                get_hyundai_steering_output_can,
-                                                update_hyundai_angle_engage, update_hyundai_angle_handover,
+from opendbc.car.hyundai.carcontroller import (hyundai_angle_lateral_authorized, ANGLE_ENGAGE_GRACE_FRAMES, CarController,
+                                                HyundaiAngleGainRecovery, apply_hyundai_angle_limits,
+                                                get_hyundai_angle_gain_limits, get_hyundai_steering_output_can,
+                                                quantize_hyundai_angle_gain, update_hyundai_angle_engage,
                                                 update_hyundai_angle_torque_reduction_gain)
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.hyundaicanfd import (CanBus, create_acc_control_from_stock, create_angle_camera_mdps,
@@ -109,15 +109,24 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
     self.assert_valid_crc(msg)
 
   def test_controller_active_command_is_bounded_inside_safety_boundary(self):
-    apply_angle = 0.0
-    for _ in range(100):
-      apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, apply_angle, True, True)
-      self.assertTrue(active)
-      self.assertLessEqual(apply_angle, 59.9)
+    for sign in (1, -1):
+      apply_angle = 0.0
+      for _ in range(300):
+        apply_angle, active = apply_hyundai_angle_limits(sign * 300.0, apply_angle, 0.0, apply_angle, True, True)
+        self.assertTrue(active)
+        self.assertLessEqual(abs(apply_angle), 175.0)
+      # held at the command limit, not released
+      self.assertEqual(apply_angle, sign * 175.0)
 
-    apply_angle, active = apply_hyundai_angle_limits(120.0, apply_angle, 0.0, 60.0, True, True)
-    self.assertFalse(active)
-    self.assertEqual(apply_angle, 60.0)
+      for measured in (60.0, 120.0, 175.0, 183.0):
+        apply_angle, active = apply_hyundai_angle_limits(sign * 300.0, sign * 175.0, 0.0, sign * measured, True, True)
+        self.assertTrue(active)
+        self.assertEqual(apply_angle, sign * min(175.0, measured + 8.0))
+
+      # the driver turned past 175 + 8 degrees: inactive, the measured angle clamped to the command limit
+      apply_angle, active = apply_hyundai_angle_limits(sign * 300.0, sign * 175.0, 0.0, sign * 184.0, True, True)
+      self.assertFalse(active)
+      self.assertEqual(apply_angle, sign * 175.0)
 
     apply_angle, active = apply_hyundai_angle_limits(-120.0, apply_angle, 0.0, 0.0, True, False)
     self.assertFalse(active)
@@ -147,30 +156,144 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
     self.assertFalse(inactive)
     self.assertEqual(inactive_angle, 17.0)
 
-  def test_driver_override_handover_requires_quiet_release_window(self):
-    allowed, latched, frames = update_hyundai_angle_handover(True, False, ANGLE_DRIVER_TORQUE_LIMIT + 1, False, 0)
-    self.assertFalse(allowed)
-    self.assertTrue(latched)
-    for _ in range(ANGLE_DRIVER_TORQUE_RELEASE_FRAMES - 1):
-      allowed, latched, frames = update_hyundai_angle_handover(True, False, 0.0, latched, frames)
-      self.assertFalse(allowed)
-    allowed, latched, frames = update_hyundai_angle_handover(True, False, 0.0, latched, frames)
-    self.assertTrue(allowed)
-    self.assertFalse(latched)
-    self.assertEqual(frames, 0)
+  def test_driver_torque_lowers_gain_without_release(self):
+    # neither 225 for one frame, nor 700, nor steeringPressed releases control; the gain drops to the floor
+    for speed in (2.0, 6.0, 12.0, 25.0):
+      _, _, floor = get_hyundai_angle_gain_limits(speed)
+      for torque, pressed in ((225.0, False), (700.0, True), (-700.0, True), (800.0, True)):
+        controller, CS, CC = self._angle_controller(speed)
+        self._run_angle_controller(controller, CS, CC, 100)
+        for frame in range(200):
+          _, active, gain = self._run_angle_controller(controller, CS, CC, 1, torque=torque, pressed=pressed and frame >= 5)
+          self.assertTrue(active)
+          self.assertGreater(gain, 0)
+        if abs(torque) >= 700:
+          self.assertAlmostEqual(gain, round(floor / 0.004), delta=1)
 
   def test_angle_torque_reduction_gain_yields_faster_than_recovery(self):
-    gain = 0.0
-    gain = update_hyundai_angle_torque_reduction_gain(0.0, 12.0, True, gain)
-    self.assertEqual(gain, 0.004)
-    for _ in range(249):
-      gain = update_hyundai_angle_torque_reduction_gain(0.0, 12.0, True, gain)
-    self.assertLessEqual(gain, 0.85)
+    for speed in (2.0, 12.0, 25.0):
+      ceiling, _, floor = get_hyundai_angle_gain_limits(speed)
+      # yield at 0.014 per frame
+      reduced = update_hyundai_angle_torque_reduction_gain(700.0, speed, True, ceiling)
+      self.assertAlmostEqual(ceiling - reduced, 0.014)
+      # restore from floor to ceiling in 0.5 s, not yet at 0.45 s
+      for recovery_time in (0.5, 1.0, 2.0, 3.0):
+        gain = floor
+        frames = 0
+        while gain < ceiling - 1e-9:
+          gain = update_hyundai_angle_torque_reduction_gain(0.0, speed, True, gain, recovery_time)
+          frames += 1
+        self.assertEqual(frames, round(recovery_time * 100), (speed, recovery_time))
+      self.assertEqual(update_hyundai_angle_torque_reduction_gain(0.0, speed, False, 0.004), 0.0)
+    self.assertEqual(quantize_hyundai_angle_gain(0.8501), 0.852)
+    self.assertEqual(quantize_hyundai_angle_gain(0.0), 0.0)
 
-    reduced = update_hyundai_angle_torque_reduction_gain(700.0, 12.0, True, gain)
-    self.assertLess(reduced, gain)
-    self.assertGreaterEqual(gain - reduced, 0.012)
-    self.assertEqual(update_hyundai_angle_torque_reduction_gain(0.0, 12.0, False, 0.004), 0.0)
+  def test_angle_gain_recovery_slows_for_repeated_interventions(self):
+    speed = 12.0
+    ceiling, _, floor = get_hyundai_angle_gain_limits(speed)
+    recovery = HyundaiAngleGainRecovery()
+    gain = ceiling
+
+    def intervene_and_recover():
+      nonlocal gain
+      for _ in range(40):
+        recovery.update(True, True, gain, speed)
+        gain = floor
+      frames = 0
+      while True:
+        recovery_time = recovery.update(True, False, gain, speed)
+        if gain >= ceiling - 1e-9:
+          return recovery_time, frames
+        gain = update_hyundai_angle_torque_reduction_gain(0.0, speed, True, gain, recovery_time)
+        frames += 1
+
+    # first intervention: 0.5 s; each new one within 5 s of a full recovery: 1, 2, 3 s, then stays at 3 s
+    for expected in (0.5, 1.0, 2.0, 3.0, 3.0):
+      _, frames = intervene_and_recover()
+      self.assertEqual(frames, round(expected * 100), expected)
+    # 5 s without an intervention resets to 0.5 s
+    for _ in range(500):
+      recovery_time = recovery.update(True, False, gain, speed)
+    self.assertEqual(recovery_time, 0.5)
+    _, frames = intervene_and_recover()
+    self.assertEqual(frames, 50)
+    # a short press (under 0.3 s) is not counted as a repeat
+    for _ in range(29):
+      recovery.update(True, True, gain, speed)
+    self.assertEqual(recovery.update(True, False, gain, speed), 0.5)
+    # losing authority resets it
+    _, _ = intervene_and_recover()
+    recovery.update(False, False, gain, speed)
+    self.assertEqual(recovery.repeats, 0)
+
+  @staticmethod
+  def _angle_controller(speed):
+    CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, TestHyundaiFingerprint._ioniq9_fingerprint(), TestHyundaiFingerprint._ioniq9_fw(),
+                                 False, False, False)
+    controller = CarController(DBC[CP.carFingerprint], CP)
+    out = CarStateStruct()
+    out.vEgo = speed
+    out.vEgoRaw = speed
+    out.cruiseState.enabled = True
+    CS = SimpleNamespace(out=out, lfa_alt={}, mdps={"COUNTER": 0, "MDPS_ADASAciActvSta_Lv2": 1, "MDPS_ADAS_AciFltSig_Lv2": 0},
+                         is_metric=True)
+    CC = CarControl()
+    CC.enabled = True
+    CC.latActive = True
+    return controller, CS, CC
+
+  @staticmethod
+  def _run_angle_controller(controller, CS, CC, frames, request=0.0, torque=0.0, pressed=False, measured=None):
+    # measured=None: the wheel follows the sent angle one frame later
+    for _ in range(frames):
+      CS.out.steeringTorque = torque
+      CS.out.steeringPressed = pressed
+      CS.out.steeringAngleDeg = controller.apply_angle_last if measured is None else measured
+      CC.actuators.steeringAngleDeg = request
+      actuators, msgs = controller.update(CC.as_reader(), CS, 0)
+      lfa = next(dat for address, dat, _ in msgs if address == 0xCB)
+    return actuators, (lfa[3] >> 4) == 2, lfa[6]
+
+  def test_angle_holds_command_limit_at_low_speed(self):
+    # 10 km/h, 300 degree request for 2 s: state 2 throughout, held at 175, gain above 0
+    for sign in (1, -1):
+      controller, CS, CC = self._angle_controller(10 / 3.6)
+      self._run_angle_controller(controller, CS, CC, 60)
+      for _ in range(300):
+        _, active, gain = self._run_angle_controller(controller, CS, CC, 1, request=sign * 300.0)
+        self.assertTrue(active)
+      for _ in range(200):
+        actuators, active, gain = self._run_angle_controller(controller, CS, CC, 1, request=sign * 300.0)
+        self.assertTrue(active)
+        self.assertGreater(gain, 0)
+        self.assertEqual(actuators.steeringAngleDeg, sign * 175.0)
+
+  def test_angle_steering_pressed_does_not_release(self):
+    controller, CS, CC = self._angle_controller(30 / 3.6)
+    self._run_angle_controller(controller, CS, CC, 60, request=20.0)
+    for _ in range(200):
+      _, active, gain = self._run_angle_controller(controller, CS, CC, 1, request=20.0, torque=-400.0, pressed=True)
+      self.assertTrue(active)
+      self.assertGreater(gain, 0)
+
+  def test_angle_driver_past_limit_releases(self):
+    for sign in (1, -1):
+      controller, CS, CC = self._angle_controller(10 / 3.6)
+      self._run_angle_controller(controller, CS, CC, 60)
+      self._run_angle_controller(controller, CS, CC, 400, request=sign * 300.0)
+      actuators, active, gain = self._run_angle_controller(controller, CS, CC, 1, request=sign * 300.0, measured=sign * 183.0)
+      self.assertTrue(active)
+      self.assertEqual(actuators.steeringAngleDeg, sign * 175.0)
+      actuators, active, gain = self._run_angle_controller(controller, CS, CC, 1, request=sign * 300.0, torque=sign * 500.0,
+                                                           pressed=True, measured=sign * 184.0)
+      self.assertFalse(active)
+      self.assertEqual(gain, 0)
+      self.assertEqual(actuators.steeringAngleDeg, sign * 175.0)
+      # back inside: active again, near the measured angle
+      actuators, active, gain = self._run_angle_controller(controller, CS, CC, 1, request=sign * 300.0, measured=sign * 178.0)
+      self.assertTrue(active)
+      self.assertGreater(gain, 0)
+      self.assertEqual(actuators.steeringAngleDeg, sign * 175.0)
 
   def test_angle_torque_output_reports_transmitted_authority(self):
     self.assertEqual(get_hyundai_steering_output_can(True, True, 0.6, 123), 150)

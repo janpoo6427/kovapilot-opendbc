@@ -2,7 +2,12 @@
 from opendbc.testing import parameterized_class
 import unittest
 
-from opendbc.car.hyundai.carcontroller import HyundaiCanFDAngleParams
+import numpy as np
+
+from opendbc.car.hyundai.carcontroller import CarController, HyundaiCanFDAngleParams
+from opendbc.car.hyundai.tests import test_hyundai as hyundai_car_tests
+from opendbc.car.hyundai.values import CAR, DBC
+from opendbc.car.structs import CarControl, CarState
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import HyundaiSafetyFlags
 from opendbc.car.lateral import get_max_angle_delta_vm, get_max_angle_vm
@@ -560,6 +565,58 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
   def test_angle_cmd_when_enabled(self):
     # the speed table is replaced by the vehicle model limits, see test_lateral_accel_limit and test_lateral_jerk_limit
     pass
+
+  def test_carcontroller_frames_pass_safety(self):
+    # 0xCB frames from the real controller: speeds 0~35 m/s, requests up to 300 degrees, driver torque up to 800,
+    # and a driver turning past 175 + 8 degrees. The wheel follows the sent angle with a lag.
+    fingerprint = hyundai_car_tests.TestHyundaiFingerprint._ioniq9_fingerprint()
+    car_fw = hyundai_car_tests.TestHyundaiFingerprint._ioniq9_fw()
+    CP = CarInterface.get_params(CAR.HYUNDAI_IONIQ_9, fingerprint, car_fw, False, False, False)
+    frames = 900
+    t = np.arange(frames) * 0.01
+    for speed in (0.0, 3.0, 8.0, 15.0, 25.0, 35.0):
+      self._reset_safety_hooks()
+      self._after_safety_reset()
+      self.angle_frame = 0
+      self.safety.set_controls_allowed(True)
+      self._reset_speed_measurement(speed)
+      controller = CarController(DBC[CP.carFingerprint], CP)
+      out = CarState()
+      out.vEgo = speed
+      out.vEgoRaw = speed
+      out.cruiseState.enabled = True
+      CS = hyundai_car_tests.SimpleNamespace(out=out, lfa_alt=self.stock_lfa, mdps=self.stock_mdps, is_metric=True)
+      CC = CarControl()
+      CC.enabled = True
+      CC.latActive = True
+      measured = 0.0
+      blocked = []
+      active_frames = 0
+      max_sent = 0.0
+      for i in range(frames):
+        request = 300.0 * np.sin(2 * np.pi * t[i] / 9.0)
+        torque = float(np.interp(t[i], [0, 2, 2.5, 4, 4.5, 6, 6.5, 9], [0, 0, 225, 225, 800, 800, -800, -800]))
+        driver_past_limit = 5.0 <= t[i] < 5.5 and speed < 5.0
+        CS.out.steeringTorque = torque
+        CS.out.steeringPressed = abs(torque) > 250
+        CS.out.steeringAngleDeg = float(measured)
+        CC.actuators.steeringAngleDeg = float(request)
+        _, msgs = controller.update(CC.as_reader(), CS, 0)
+        address, dat, _ = next(msg for msg in msgs if msg[0] == 0xCB)
+        self.safety.set_timer(self.angle_frame * int(1e6 / self.LATERAL_FREQUENCY))
+        self.angle_frame += 1
+        if not self._tx(libsafety_py.make_CANPacket(address, 0, bytes(dat))):
+          blocked.append((speed, i))
+        active_frames += (dat[3] >> 4) == 2
+        # the wheel follows the sent angle; a driver can turn it past the command limit
+        sent = controller.apply_angle_last
+        max_sent = max(max_sent, abs(sent))
+        measured = 190.0 * np.sign(request) if driver_past_limit else measured + 0.2 * (sent - measured)
+        self._rx(self._angle_meas_msg(round(measured, 1), MDPS_StrTqSnsrVal=torque))
+      self.assertEqual(blocked, [], speed)
+      self.assertGreater(active_frames, frames * 0.8, speed)
+      if speed < 5.0:
+        self.assertEqual(max_sent, 175.0)
 
   def test_lateral_accel_limit(self):
     for speed in self.VM_TEST_SPEEDS:
