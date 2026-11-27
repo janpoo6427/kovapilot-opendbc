@@ -58,6 +58,8 @@ class CarState(CarStateBase):
     self.cruise_info = {}
     self.lfa_alt = {}
     self.mdps = {}
+    self.ccnc_161 = {}
+    self.ccnc_161_nanos = 0
 
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
@@ -299,6 +301,8 @@ class CarState(CarStateBase):
     if self.CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
       self.lfa_alt = copy.copy(cp_cam.vl["LFA_ALT"])
       self.mdps = copy.copy(cp.vl["MDPS"])
+      self.ccnc_161 = copy.copy(cp_cam.vl["CCNC_0x161"])
+      self.ccnc_161_nanos = cp_cam.ts_nanos["CCNC_0x161"]["COUNTER"]
 
     ret.buttonEvents = [*create_button_events(self.cruise_buttons[-1], prev_cruise_buttons, BUTTONS_DICT),
                         *create_button_events(self.main_buttons[-1], prev_main_buttons, {1: ButtonType.mainCruise}),
@@ -323,15 +327,22 @@ class CarState(CarStateBase):
     cam_msgs = []
     if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
       cam_msgs.append(("LFA_ALT", 100))
+      # Stock cluster frame, copied while openpilot steers. Never part of CAN validity.
+      cam_msgs.append(("CCNC_0x161", math.nan))
     if CP.flags & HyundaiFlags.CANFD_LONGITUDINAL_CANDIDATE:
       # The replacement SCC_CONTROL is built from the live stock camera frame.
       # Make loss of that template invalidate CAN instead of silently emitting
       # a zero-filled longitudinal command.
       cam_msgs.append(("SCC_CONTROL", 50))
-    return {
+    parsers = {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CanBus(CP).ECAN),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_msgs, CanBus(CP).CAM),
     }
+    if CP.flags & HyundaiFlags.CANFD_ANGLE_STEERING:
+      # A counter gap in this display frame must not invalidate the camera bus either. Checksum failures still
+      # keep a corrupt frame from being copied.
+      parsers[Bus.cam].message_states[0x161].ignore_counter = True
+    return parsers
 
   def get_can_parsers(self, CP):
     if CP.flags & HyundaiFlags.CANFD:

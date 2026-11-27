@@ -50,6 +50,9 @@ static unsigned int hyundai_canfd_get_lka_addr(void) {
   return safety_setup.hyundai_canfd_lka_steer_msg_alt ? 0x110U : 0x50U;
 }
 
+// A host CCNC_0x161 copy older than this no longer replaces the stock camera frame
+#define HYUNDAI_CANFD_CCNC_HOST_MAX_AGE_US 150000U
+
 static uint8_t hyundai_canfd_get_counter(const CANPacket_t *msg) {
   uint8_t ret = 0;
   if (GET_LEN(msg) == 8U) {
@@ -298,6 +301,22 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  // CCNC_0x161 (cluster): the host copy of a stock camera frame goes out only in place of the stock frame
+  // that the forwarding hook held back for it, once, while lateral control is allowed.
+  if (safety_setup.hyundai_canfd_angle_steering && msg_matches(msg, 0x161U, 0U)) {
+    const bool valid_copy = safety.controls_allowed &&
+                            (hyundai_canfd_get_checksum(msg) == hyundai_common_canfd_compute_checksum(msg));
+    if (valid_copy) {
+      safety.hyundai_ccnc_host_seen = true;
+      safety.hyundai_ccnc_host_ts = safety_ts;
+    }
+    if (!valid_copy || !safety.hyundai_ccnc_stock_pending) {
+      tx = false;
+    } else {
+      safety.hyundai_ccnc_stock_pending = false;
+    }
+  }
+
   // steering
   const unsigned int steer_addr = (safety_setup.hyundai_canfd_lka_steer_msg && !safety_setup.hyundai_longitudinal) ? hyundai_canfd_get_lka_addr() : 0x12aU;
   if (msg->addr == steer_addr) {
@@ -359,6 +378,21 @@ static bool hyundai_canfd_tx_hook(const CANPacket_t *msg) {
   return tx;
 }
 
+static bool hyundai_canfd_fwd_hook(int bus_num, int addr) {
+  bool block_msg = false;
+  if (safety_setup.hyundai_canfd_angle_steering && (bus_num == 2) && (addr == 0x161)) {
+    if (safety.hyundai_ccnc_stock_pending) {
+      // the previous held-back stock frame was never replaced: forward stock until a new host copy arrives
+      safety.hyundai_ccnc_host_seen = false;
+    }
+    const bool host_fresh = safety.hyundai_ccnc_host_seen &&
+                            (safety_get_ts_elapsed(safety_ts, safety.hyundai_ccnc_host_ts) < HYUNDAI_CANFD_CCNC_HOST_MAX_AGE_US);
+    block_msg = host_fresh && safety.controls_allowed;
+    safety.hyundai_ccnc_stock_pending = block_msg;
+  }
+  return block_msg;
+}
+
 static safety_config hyundai_canfd_init(uint16_t param) {
   const uint16_t HYUNDAI_PARAM_CANFD_LKA_STEER_MSG_ALT = 128;
   const uint16_t HYUNDAI_PARAM_CANFD_ALT_BUTTONS = 32;
@@ -392,14 +426,16 @@ static safety_config hyundai_canfd_init(uint16_t param) {
   };
 
   static const CanMsg HYUNDAI_CANFD_ANGLE_STEERING_TX_MSGS[] = {
-    {0xCB, 0, 24, .check_relay = true},  // LFA_ALT
-    {0xEA, 2, 24, .check_relay = true},  // camera MDPS mirror
+    {0xCB, 0, 24, .check_relay = true},    // LFA_ALT
+    {0xEA, 2, 24, .check_relay = true},    // camera MDPS mirror
+    {0x161, 0, 32, .check_relay = false},  // CCNC_0x161 copy, see hyundai_canfd_fwd_hook
   };
 
   static const CanMsg HYUNDAI_CANFD_ANGLE_STEERING_LONG_TX_MSGS[] = {
-    {0xCB,  0, 24, .check_relay = true},  // LFA_ALT
-    {0xEA,  2, 24, .check_relay = true},  // camera MDPS mirror
-    {0x1A0, 0, 32, .check_relay = true},  // SCC_CONTROL
+    {0xCB,  0, 24, .check_relay = true},   // LFA_ALT
+    {0xEA,  2, 24, .check_relay = true},   // camera MDPS mirror
+    {0x1A0, 0, 32, .check_relay = true},   // SCC_CONTROL
+    {0x161, 0, 32, .check_relay = false},  // CCNC_0x161 copy, see hyundai_canfd_fwd_hook
   };
 
   // ADRV_0x160 is checked for radar liveness
@@ -545,6 +581,7 @@ static const safety_hooks hyundai_canfd_hooks = {
   .init = hyundai_canfd_init,
   .rx = hyundai_canfd_rx_hook,
   .tx = hyundai_canfd_tx_hook,
+  .fwd = hyundai_canfd_fwd_hook,
   .get_counter = hyundai_canfd_get_counter,
   .get_checksum = hyundai_canfd_get_checksum,
   .compute_checksum = hyundai_common_canfd_compute_checksum,

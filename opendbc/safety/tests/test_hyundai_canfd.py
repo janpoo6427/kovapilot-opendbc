@@ -519,6 +519,106 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, common.AngleSteeringSafet
       self._rx(self._angle_meas_msg(0, MDPS_ADAS_AciFltSig_Lv2=status))
       self.assertEqual(status in (0, 2), self.safety.get_controls_allowed(), status)
 
+  # *** CCNC_0x161: host copy in place of the stock camera cluster frame ***
+
+  CCNC_PERIOD_US = 50000  # stock frame every 50 ms
+  CCNC_HOST_DELAY_US = 20000
+
+  def _ccnc_msg(self, counter, alerts_2=0, sounds_2=0):
+    return self.packer.make_can_msg_safety("CCNC_0x161", 0, {"COUNTER": counter, "ALERTS_2": alerts_2, "SOUNDS_2": sounds_2,
+                                                             "LKA_ICON": 4, "SETSPEED_SPEED": 80})
+
+  def _ccnc_stock_forwarded(self, t_us):
+    self.safety.set_timer(t_us)
+    return self.safety.safety_fwd_hook(2, 0x161) == 0
+
+  def _ccnc_copy(self, t_us, counter, msg=None):
+    self.safety.set_timer(t_us)
+    return self._tx(self._ccnc_msg(counter) if msg is None else msg)
+
+  def _ccnc_cycles(self, start_frame, frames, copy=True):
+    # one stock frame per period, the host copy follows each stock frame; returns (forwarded, copy sent) per frame
+    out = []
+    for frame in range(start_frame, start_frame + frames):
+      t = frame * self.CCNC_PERIOD_US
+      forwarded = self._ccnc_stock_forwarded(t)
+      sent = self._ccnc_copy(t + self.CCNC_HOST_DELAY_US, frame & 0xFF) if copy else None
+      out.append((forwarded, sent))
+    return out
+
+  def test_ccnc_copy_replaces_stock_while_steering(self):
+    self.safety.set_controls_allowed(True)
+    cycles = self._ccnc_cycles(1, 30)
+    # first stock frame goes out before the host is known; its late copy is dropped so no counter is sent twice
+    self.assertEqual(cycles[0], (True, False))
+    # afterwards each stock frame is replaced by exactly one host copy
+    self.assertEqual(cycles[1:], [(False, True)] * 29)
+
+  def test_ccnc_copy_sent_only_once_per_stock_frame(self):
+    self.safety.set_controls_allowed(True)
+    self._ccnc_cycles(1, 3)
+    self.assertFalse(self._ccnc_stock_forwarded(4 * self.CCNC_PERIOD_US))
+    self.assertTrue(self._ccnc_copy(4 * self.CCNC_PERIOD_US + 10000, 4))
+    self.assertFalse(self._ccnc_copy(4 * self.CCNC_PERIOD_US + 20000, 4))
+
+  def test_ccnc_stock_when_not_steering(self):
+    self.safety.set_controls_allowed(False)
+    self.assertEqual(self._ccnc_cycles(1, 20), [(True, False)] * 20)
+    # stock is forwarded with no host copy at all
+    self.safety.set_controls_allowed(True)
+    self.assertEqual(self._ccnc_cycles(21, 20, copy=False), [(True, None)] * 20)
+
+  def test_ccnc_stock_after_disengage(self):
+    self.safety.set_controls_allowed(True)
+    self.assertEqual(self._ccnc_cycles(1, 5)[1:], [(False, True)] * 4)
+    self.safety.set_controls_allowed(False)
+    self.assertEqual(self._ccnc_cycles(6, 10), [(True, False)] * 10)
+
+  def test_ccnc_stale_copy_forwards_stock(self):
+    max_age = 150000
+    for gap, forwarded in ((max_age - 1, False), (max_age, True), (max_age + 50000, True)):
+      self._reset_safety_hooks()
+      self.safety.set_controls_allowed(True)
+      self._ccnc_cycles(1, 3)
+      last_copy = 3 * self.CCNC_PERIOD_US + self.CCNC_HOST_DELAY_US
+      self.assertEqual(self._ccnc_stock_forwarded(last_copy + gap), forwarded, gap)
+
+  def test_ccnc_bad_checksum_copy_forwards_stock(self):
+    self.safety.set_controls_allowed(True)
+    self._ccnc_cycles(1, 3)
+    t = 4 * self.CCNC_PERIOD_US
+    self.assertFalse(self._ccnc_stock_forwarded(t))
+    msg = self._ccnc_msg(4)
+    dat = bytearray(msg.data)[:32]
+    dat[0] ^= 1
+    self.assertFalse(self._ccnc_copy(t + self.CCNC_HOST_DELAY_US, 4, libsafety_py.make_CANPacket(msg.addr, msg.bus, bytes(dat))))
+    # the held-back frame is lost once, then stock is forwarded until a valid copy arrives
+    self.assertEqual(self._ccnc_cycles(5, 5, copy=False), [(True, None)] * 5)
+    self.assertEqual(self._ccnc_cycles(10, 3), [(True, False), (False, True), (False, True)])
+
+  def test_ccnc_late_copy_forwards_stock(self):
+    self.safety.set_controls_allowed(True)
+    self._ccnc_cycles(1, 3)
+    t = 4 * self.CCNC_PERIOD_US
+    self.assertFalse(self._ccnc_stock_forwarded(t))
+    # the copy of frame 4 has not arrived when frame 5 comes: frame 5 is forwarded and the late copy is dropped
+    self.assertTrue(self._ccnc_stock_forwarded(t + self.CCNC_PERIOD_US))
+    self.assertFalse(self._ccnc_copy(t + self.CCNC_PERIOD_US + 5000, 4))
+    self.assertEqual(self._ccnc_cycles(6, 3), [(False, True)] * 3)
+
+  def test_ccnc_copy_needs_stock_frame(self):
+    self.safety.set_controls_allowed(True)
+    # host copies alone never reach the cluster without a held-back stock frame
+    for frame in range(1, 10):
+      self.assertFalse(self._ccnc_copy(frame * self.CCNC_PERIOD_US, frame))
+
+  def test_ccnc_other_buses_and_modes_forwarded(self):
+    self.safety.set_controls_allowed(True)
+    self._ccnc_cycles(1, 3)
+    self.safety.set_timer(4 * self.CCNC_PERIOD_US)
+    self.assertEqual(self.safety.safety_fwd_hook(0, 0x161), 2)
+    self.assertEqual(self.safety.safety_fwd_hook(2, 0x162), 0)
+
 
 class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanfdAngleSteering):
 

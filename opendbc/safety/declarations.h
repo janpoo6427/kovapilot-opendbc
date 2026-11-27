@@ -339,6 +339,9 @@ typedef struct {
   bool hyundai_angle_stock_mdps_prev_valid;
   uint8_t hyundai_angle_mdps_tx_counter;
   bool hyundai_angle_mdps_tx_counter_valid;
+  bool hyundai_ccnc_host_seen;      // host sent a valid CCNC_0x161 copy and has not fallen behind since
+  uint32_t hyundai_ccnc_host_ts;    // last valid host CCNC_0x161 copy
+  bool hyundai_ccnc_stock_pending;  // the last stock CCNC_0x161 was held back and waits for its host copy
   bool tesla_stock_aeb;
   // Only rising edges while controls are not allowed are considered for these systems:
   // TODO: Only LKAS (non-emergency) is currently supported since we've only seen it
