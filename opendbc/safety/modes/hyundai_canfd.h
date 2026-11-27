@@ -74,6 +74,19 @@ static uint8_t hyundai_canfd_camera_mdps_state(uint8_t camera_state, uint8_t mdp
   return (camera_operational && mdps_operational) ? camera_state : mdps_state;
 }
 
+static bool hyundai_canfd_pedal_resume_enabled(void) {
+  return safety_setup.hyundai_longitudinal &&
+         ((((uint32_t)safety_setup.alternative_experience) & ALT_EXP_PEDAL_RESUME) != 0U);
+}
+
+// ALT_EXP_PEDAL_RESUME: the driver's own pedal release (brake or accelerator), seen here on the
+// car bus, re-allows controls while cruise is available. The host decides whether to engage.
+static void hyundai_canfd_pedal_resume(bool pedal_released) {
+  if (pedal_released && safety.acc_main_on && !safety.hyundai_pedal_resume_blocked && !safety.brake_pressed) {
+    safety.controls_allowed = true;
+  }
+}
+
 static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   const unsigned pt_bus = safety_setup.hyundai_canfd_lka_steer_msg ? 1U : 0U;
   const unsigned int scc_bus = safety_setup.hyundai_camera_scc ? 2U : pt_bus;
@@ -135,7 +148,17 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
       main_button = GET_BIT(msg, 34U);
       lfa_button = GET_BIT(msg, 39U);
     }
+    const uint8_t cruise_button_prev = safety.cruise_button_prev;
     hyundai_common_cruise_buttons_check(cruise_button, main_button);
+    if (hyundai_canfd_pedal_resume_enabled()) {
+      if (cruise_button == HYUNDAI_BTN_CANCEL) {
+        safety.hyundai_pedal_resume_blocked = true;
+      } else if ((cruise_button != cruise_button_prev) &&
+                 ((cruise_button_prev == HYUNDAI_BTN_SET) || (cruise_button_prev == HYUNDAI_BTN_RESUME))) {
+        safety.hyundai_pedal_resume_blocked = false;
+      } else {
+      }
+    }
 
     // the LFA button is a driver engagement for always-on lateral
     if (lfa_button && always_on_lateral_enabled()) {
@@ -144,19 +167,34 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
   }
 
   // gas press, different for EV, hybrid, and ICE models
+  bool gas_msg = false;
   if (msg_matches(msg, 0x35U, pt_bus) && safety_setup.hyundai_ev_gas_signal) {
     safety.gas_pressed = msg->data[5] != 0U;
+    gas_msg = true;
   }
   if (msg_matches(msg, 0x105U, pt_bus) && safety_setup.hyundai_hybrid_gas_signal) {
     safety.gas_pressed = ((msg->data[12] >> 7) | msg->data[13] | (msg->data[14] & 1U)) != 0U;
+    gas_msg = true;
   }
   if (msg_matches(msg, 0x100U, pt_bus) && !safety_setup.hyundai_ev_gas_signal && !safety_setup.hyundai_hybrid_gas_signal) {
     safety.gas_pressed = GET_BIT(msg, 176U);
+    gas_msg = true;
+  }
+  if (gas_msg && hyundai_canfd_pedal_resume_enabled()) {
+    hyundai_canfd_pedal_resume(safety.gas_pressed_prev && !safety.gas_pressed);
   }
 
   // brake press
   if (msg_matches(msg, 0x175U, pt_bus)) {
     safety.brake_pressed = GET_BIT(msg, 81U);
+    if (hyundai_canfd_pedal_resume_enabled()) {
+      // TCS ACCEnable: 0 means the car allows cruise (CarState.cruiseState.available)
+      safety.acc_main_on = ((msg->data[8] >> 2) & 0x3U) == 0U;
+      if (!safety.acc_main_on) {
+        safety.controls_allowed = false;
+      }
+      hyundai_canfd_pedal_resume(safety.brake_pressed_prev && !safety.brake_pressed);
+    }
   }
 
   // vehicle moving

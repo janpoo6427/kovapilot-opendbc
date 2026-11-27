@@ -257,6 +257,11 @@ void safety_alternative_experience(int alt_exp);
 // It is still blocked while braking, at standstill, and on RX faults (see lateral_controls_allowed).
 #define ALT_EXP_ALWAYS_ON_LATERAL 1024U
 
+// Pedal resume (Hyundai CAN FD with openpilot longitudinal): the driver releasing the brake or the
+// accelerator re-allows controls while the car reports cruise available, unless the driver pressed
+// CANCEL since the last SET/RES. Brake, CANCEL and cruise unavailable still exit controls at once.
+#define ALT_EXP_PEDAL_RESUME 2048U
+
 typedef enum {
   CHRYSLER_RAM_DT,
   CHRYSLER_RAM_HD,
@@ -348,6 +353,7 @@ typedef struct {
   bool hyundai_ccnc_host_seen;      // host sent a valid CCNC_0x161 copy and has not fallen behind since
   uint32_t hyundai_ccnc_host_ts;    // last valid host CCNC_0x161 copy
   bool hyundai_ccnc_stock_pending;  // the last stock CCNC_0x161 was held back and waits for its host copy
+  bool hyundai_pedal_resume_blocked;  // CANCEL pressed since the last SET/RES; blocks pedal resume
   bool tesla_stock_aeb;
   // Only rising edges while controls are not allowed are considered for these systems:
   // TODO: Only LKAS (non-emergency) is currently supported since we've only seen it

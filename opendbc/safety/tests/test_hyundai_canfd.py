@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from collections.abc import Callable
 from opendbc.testing import parameterized_class
 import unittest
 
@@ -14,7 +15,8 @@ from opendbc.car.lateral import get_max_angle_delta_vm, get_max_angle_vm
 from opendbc.car.vehicle_model import VehicleModel
 from opendbc.car.structs import CarParams
 import opendbc.safety.tests.common as common
-from opendbc.safety.tests.hyundai_common import HyundaiAlwaysOnLateralBase, HyundaiButtonBase, HyundaiLongitudinalBase
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
+from opendbc.safety.tests.hyundai_common import Buttons, HyundaiAlwaysOnLateralBase, HyundaiButtonBase, HyundaiLongitudinalBase
 from opendbc.safety.tests.libsafety import libsafety_py
 
 # All combinations of radar/camera-SCC and gas/hybrid/EV cars
@@ -28,6 +30,156 @@ ALL_GAS_EV_HYBRID_COMBOS = [
   {"GAS_MSG": ("ACCELERATOR", "ACCELERATOR_PEDAL"), "SCC_BUS": 2, "EXTRA_SAFETY_PARAM": HyundaiSafetyFlags.EV_GAS | HyundaiSafetyFlags.CAMERA_SCC},
   {"GAS_MSG": ("ACCELERATOR_ALT", "ACCELERATOR_PEDAL"), "SCC_BUS": 2, "EXTRA_SAFETY_PARAM": HyundaiSafetyFlags.HYBRID_GAS | HyundaiSafetyFlags.CAMERA_SCC},
 ]
+
+
+class HyundaiCanfdPedalResumeBase(HyundaiLongitudinalBase):
+  """
+    ALT_EXP_PEDAL_RESUME: the driver's brake or accelerator release re-allows controls while
+    TCS reports cruise available (ACCEnable 0) and no CANCEL was pressed since the last SET/RES.
+    Brake, CANCEL and cruise unavailable still exit controls. Needs openpilot longitudinal.
+  """
+
+  PT_BUS: int
+  _after_safety_reset: Callable[[], None]
+  _moving_msg: Callable[..., libsafety_py.CANPacket]
+  _user_gas_msg: Callable[..., libsafety_py.CANPacket]
+
+  def setUp(self):
+    super().setUp()
+    self._pedal_resume()
+
+  def _pedal_resume(self, alt_exp=ALTERNATIVE_EXPERIENCE.PEDAL_RESUME, safety_param=None):
+    # fresh safety state as in setUp (init_tests keeps the relay malfunction checks active)
+    self.safety.set_safety_hooks(self.SAFETY_MODEL, self.SAFETY_PARAM if safety_param is None else safety_param)
+    self.safety.init_tests()
+    self._after_safety_reset()
+    self.safety.set_alternative_experience(alt_exp)
+
+  def _tcs_msg(self, brake, acc_enable=0):
+    return self.packer.make_can_msg_safety("TCS", self.PT_BUS, {"DriverBraking": brake, "ACCEnable": acc_enable})
+
+  def _brake_tap(self, acc_enable=0):
+    self._rx(self._tcs_msg(1, acc_enable))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._rx(self._tcs_msg(0, acc_enable))
+
+  def _gas_tap(self):
+    self._rx(self._user_gas_msg(1))
+    self._rx(self._user_gas_msg(0))
+
+  def test_pedal_resume_brake_release(self):
+    for moving in (False, True):
+      self._pedal_resume()
+      self._rx(self._moving_msg(moving))
+      self._rx(self._tcs_msg(0))
+      self.assertFalse(self.safety.get_controls_allowed())
+      self._brake_tap()
+      self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_gas_release(self):
+    for moving in (False, True):
+      self._pedal_resume()
+      self._rx(self._moving_msg(moving))
+      self._rx(self._tcs_msg(0))
+      self._rx(self._user_gas_msg(1))
+      self.assertFalse(self.safety.get_controls_allowed())
+      self._rx(self._user_gas_msg(0))
+      self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_needs_release(self):
+    self._rx(self._tcs_msg(0))
+    for _ in range(10):
+      self._rx(self._tcs_msg(0))
+      self._rx(self._user_gas_msg(0))
+      self._rx(self._button_msg(Buttons.NONE))
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._rx(self._tcs_msg(1))
+    self._rx(self._user_gas_msg(1))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_gas_release_while_braking(self):
+    self._rx(self._tcs_msg(1))
+    self._gas_tap()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_cruise_unavailable(self):
+    for acc_enable in (1, 2, 3):
+      self._pedal_resume()
+      self._brake_tap(acc_enable)
+      self.assertFalse(self.safety.get_controls_allowed())
+      self._gas_tap()
+      self.assertFalse(self.safety.get_controls_allowed())
+      # unavailable exits controls, also after a SET engagement
+      self._rx(self._tcs_msg(0))
+      self._cruise_engage()
+      self.assertTrue(self.safety.get_controls_allowed())
+      self._rx(self._tcs_msg(0, acc_enable))
+      self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_unavailable_before_tcs(self):
+    # cruise counts as unavailable until the first TCS frame
+    self._gas_tap()
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_brake_exits(self):
+    self._rx(self._moving_msg(True))
+    self._brake_tap()
+    self.assertTrue(self.safety.get_controls_allowed())
+    self._rx(self._tcs_msg(1))
+    self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_cancel_blocks_until_set_resume(self):
+    for unblock in (Buttons.SET, Buttons.RESUME):
+      self._pedal_resume()
+      self._brake_tap()
+      self.assertTrue(self.safety.get_controls_allowed())
+      self._rx(self._button_msg(Buttons.CANCEL))
+      self.assertFalse(self.safety.get_controls_allowed())
+      self._rx(self._button_msg(Buttons.NONE))
+      self._brake_tap()
+      self.assertFalse(self.safety.get_controls_allowed())
+      self._gas_tap()
+      self.assertFalse(self.safety.get_controls_allowed())
+      # the main and LFA buttons do not clear the block
+      self._rx(self._button_msg(Buttons.NONE, main_button=1, lfa_button=1))
+      self._rx(self._button_msg(Buttons.NONE))
+      self._brake_tap()
+      self.assertFalse(self.safety.get_controls_allowed())
+      # CANCEL straight to SET/RES and held: not yet a SET/RES release
+      self._rx(self._button_msg(Buttons.CANCEL))
+      self._rx(self._button_msg(unblock))
+      self.assertFalse(self.safety.get_controls_allowed())
+      self._brake_tap()
+      self.assertFalse(self.safety.get_controls_allowed())
+      self._rx(self._button_msg(Buttons.NONE))
+      self.assertTrue(self.safety.get_controls_allowed())
+      self.safety.set_controls_allowed(False)
+      self._brake_tap()
+      self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_main_button_does_not_block(self):
+    self._rx(self._button_msg(Buttons.NONE, main_button=1))
+    self._rx(self._button_msg(Buttons.NONE))
+    self._brake_tap()
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_needs_flag(self):
+    self._pedal_resume(ALTERNATIVE_EXPERIENCE.DEFAULT)
+    self._brake_tap()
+    self.assertFalse(self.safety.get_controls_allowed())
+    self._gas_tap()
+    self.assertFalse(self.safety.get_controls_allowed())
+    # without the flag, cruise unavailable does not exit controls (unchanged)
+    self._cruise_engage()
+    self._rx(self._tcs_msg(0, 1))
+    self.assertTrue(self.safety.get_controls_allowed())
+
+  def test_pedal_resume_needs_longitudinal(self):
+    self._pedal_resume(safety_param=self.SAFETY_PARAM & ~HyundaiSafetyFlags.LONG)
+    self._rx(self._tcs_msg(0))
+    self._brake_tap()
+    self._gas_tap()
+    self.assertFalse(self.safety.get_controls_allowed())
 
 
 class TestHyundaiCanfdBase(HyundaiButtonBase, HyundaiAlwaysOnLateralBase, common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest,
@@ -830,6 +982,10 @@ class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanf
     super().test_tester_present_allowed(ecu_disable=False)
 
 
+class TestHyundaiCanfdAngleSteeringLongPedalResume(HyundaiCanfdPedalResumeBase, TestHyundaiCanfdAngleSteeringLong):
+  pass
+
+
 # Tests longitudinal for ICE, hybrid, EV cars with LFA steering
 class TestHyundaiCanfdLFASteeringLongBase(HyundaiLongitudinalBase, TestHyundaiCanfdLFASteeringBase):
 
@@ -885,6 +1041,15 @@ class TestHyundaiCanfdLFASteeringLongAltButtons(TestHyundaiCanfdLFASteeringLongB
   def test_acc_cancel(self):
     # Alt buttons does not use SCC_CONTROL to cancel if longitudinal
     pass
+
+
+@parameterized_class(ALL_GAS_EV_HYBRID_COMBOS)
+class TestHyundaiCanfdLFASteeringLongPedalResume(HyundaiCanfdPedalResumeBase, TestHyundaiCanfdLFASteeringLongBase):
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    if cls.__name__ == "TestHyundaiCanfdLFASteeringLongPedalResume":
+      raise unittest.SkipTest
 
 
 if __name__ == "__main__":
