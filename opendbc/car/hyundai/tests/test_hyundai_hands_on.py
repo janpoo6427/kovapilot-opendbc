@@ -8,11 +8,14 @@ from opendbc.car.can_definitions import CanData
 from opendbc.car.hyundai import hyundaicanfd
 from opendbc.car.hyundai.carcontroller import CCNC_COPY_MAX_AGE_NS
 from opendbc.car.hyundai.hyundaicanfd import CanBus
+from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.tests.test_hyundai_blindspot import STEP_NS, ioniq9, seltos
 
 DBC_NAME = "hyundai_canfd_generated"
 # ALERTS_2 is bits 134..138, SOUNDS_2 bits 164..167
 EDITED_BITS = set(range(134, 139)) | set(range(164, 168))
+# LFA_ICON is bits 224..227
+LFA_ICON_BITS = set(range(224, 228))
 CHECKSUM_BITS = set(range(16))
 
 
@@ -34,10 +37,11 @@ def random_ccnc(packer, rng, bus=2, **fixed):
   return packer.make_can_msg("CCNC_0x161", bus, values)
 
 
-def copy_of(packer, dat):
+def copy_of(packer, dat, lateral_active=False):
   parser = CANParser(DBC_NAME, [("CCNC_0x161", 0)], 2)
   parser.update([(1, [(0x161, dat, 2)])])
-  return hyundaicanfd.create_ccnc_hands_on_cleared(packer, CanBus(None, gen_empty_fingerprint()), parser.vl["CCNC_0x161"])
+  return hyundaicanfd.create_ccnc_hands_on_cleared(packer, CanBus(None, gen_empty_fingerprint()), parser.vl["CCNC_0x161"],
+                                                   lateral_active)
 
 
 class TestCcncCopy(unittest.TestCase):
@@ -72,6 +76,25 @@ class TestCcncCopy(unittest.TestCase):
         self.assertEqual(out[2], dat[2])  # stock COUNTER kept
         self.assertEqual([after[i] for i in sorted(EDITED_BITS)], [0] * len(EDITED_BITS))
 
+  def test_lfa_icon_signal(self):
+    values = CANDefine(DBC_NAME).dv["CCNC_0x161"]["LFA_ICON"]
+    self.assertEqual((values[1], values[hyundaicanfd.CCNC_LFA_ICON_ACTIVE]), ("GRAY", "GREEN"))
+    sig = self.packer.dbc.name_to_msg["CCNC_0x161"].sigs["LFA_ICON"]
+    self.assertEqual((sig.start_bit, sig.size), (224, 4))
+
+  def test_lfa_icon_green_while_steering(self):
+    for _ in range(500):
+      alerts_2 = self.rng.choice([0, 1, 2, 3, 4, 5, 6, 10, 21, 22, 31])
+      lfa_icon = self.rng.choice([0, 1, 2, 3])
+      _, dat, _ = random_ccnc(self.packer, self.rng, ALERTS_2=alerts_2, LFA_ICON=lfa_icon)
+      _, out, _ = copy_of(self.packer, dat, lateral_active=True)
+      before, after = bits(dat), bits(out)
+      changed = {i for i in range(len(before)) if before[i] != after[i]}
+      allowed = LFA_ICON_BITS | CHECKSUM_BITS | (EDITED_BITS if alerts_2 in hyundaicanfd.CCNC_HANDS_ON_ALERTS else set())
+      self.assertTrue(changed <= allowed, changed - allowed)
+      self.assertEqual(out[2], dat[2])  # stock COUNTER kept
+      self.assertEqual(sum(after[224 + i] << i for i in range(4)), hyundaicanfd.CCNC_LFA_ICON_ACTIVE)
+
 
 def car_control(lat_active):
   CC = structs.CarControl()
@@ -105,6 +128,28 @@ class TestCcncController(unittest.TestCase):
       parser.update([(i + 1, [(s[0], s[1], s[2])])])
       self.assertEqual((parser.vl["CCNC_0x161"]["COUNTER"], parser.vl["CCNC_0x161"]["ALERTS_2"],
                         parser.vl["CCNC_0x161"]["SOUNDS_2"], parser.vl["CCNC_0x161"]["LKA_ICON"]), (i, 0, 0, 4))
+
+  def test_ioniq9_lfa_icon_green_while_steering(self):
+    # stock camera sends LFA_ICON 1 (gray) while openpilot steers (IONIQ 9 rlog 0000079c); the copy shows it green,
+    # also with always-on lateral (latActive without enabled)
+    from opendbc.safety import ALTERNATIVE_EXPERIENCE
+    for always_on, enabled, shown in ((False, True, True), (True, True, True), (True, False, True), (False, False, False)):
+      CP, _, packer = ioniq9()
+      if always_on:
+        CP.alternativeExperience |= ALTERNATIVE_EXPERIENCE.ALWAYS_ON_LATERAL
+      CI = CarInterface(CP)
+      CC = structs.CarControl()
+      CC.enabled = enabled
+      CC.latActive = True
+      msg = CanData(*packer.make_can_msg("CCNC_0x161", CanBus(CP).CAM, {"COUNTER": 1, "LFA_ICON": 1, "LKA_ICON": 4}))
+      CI.update([(STEP_NS, [msg])])
+      _, sends = CI.apply(CC.as_reader(), STEP_NS)
+      copies = [s for s in sends if s[0] == 0x161]
+      self.assertEqual(len(copies), 1)
+      parser = CANParser(DBC_NAME, [("CCNC_0x161", 0)], CanBus(CP).ECAN)
+      parser.update([(1, [copies[0]])])
+      self.assertEqual((parser.vl["CCNC_0x161"]["LFA_ICON"], parser.vl["CCNC_0x161"]["LKA_ICON"]),
+                       (hyundaicanfd.CCNC_LFA_ICON_ACTIVE if shown else 1, 4), (always_on, enabled))
 
   def test_ioniq9_no_copy_when_not_steering(self):
     _, CI, packer = ioniq9()

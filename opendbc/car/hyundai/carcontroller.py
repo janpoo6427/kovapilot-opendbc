@@ -366,11 +366,13 @@ class CarController(CarControllerBase):
                                                           self.apply_angle_last, self.angle_torque_reduction_gain, CS.lfa_alt))
       can_sends.append(hyundaicanfd.create_angle_camera_mdps(self.packer, self.CAN, CS.mdps, CS.lfa_alt))
       # While openpilot steers, send one copy of each new stock CCNC_0x161 frame with the camera hands-on warning
-      # removed. panda forwards the stock frame instead when this copy is missing, late or older than 150 ms.
+      # removed and the cluster LFA icon green (also with always-on lateral, see lateral_hud_enabled).
+      # panda forwards the stock frame instead when this copy is missing, late or older than 150 ms.
       ccnc_161_nanos = getattr(CS, "ccnc_161_nanos", 0)
       ccnc_fresh = now_nanos is not None and 0 <= now_nanos - ccnc_161_nanos <= CCNC_COPY_MAX_AGE_NS
       if CC.latActive and ccnc_161_nanos != self.ccnc_161_nanos_last and ccnc_fresh:
-        can_sends.append(hyundaicanfd.create_ccnc_hands_on_cleared(self.packer, self.CAN, CS.ccnc_161))
+        can_sends.append(hyundaicanfd.create_ccnc_hands_on_cleared(self.packer, self.CAN, CS.ccnc_161,
+                                                                   self.lateral_hud_enabled(CC)))
       self.ccnc_161_nanos_last = ccnc_161_nanos
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, self.lateral_hud_enabled(CC),

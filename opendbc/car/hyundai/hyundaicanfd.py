@@ -97,14 +97,21 @@ def create_angle_camera_mdps(packer, CAN, mdps, lfa_alt):
 # hands-off timer while openpilot steers (IONIQ 9, 2026-11-27: 6 warnings in 46 min, red one with SOUNDS_2=3).
 CCNC_HANDS_ON_ALERTS = (1, 2)
 
+# CCNC_0x161 LFA_ICON (DBC VAL_ 353 LFA_ICON): 1 GRAY, 2 GREEN. The stock camera keeps the cluster LFA icon gray
+# while openpilot steers (IONIQ 9 rlog 0000079c, 2026-11-27: LFA_ICON 1 in 4604 of 4611 frames with latActive, never 2).
+CCNC_LFA_ICON_ACTIVE = 2
 
-def create_ccnc_hands_on_cleared(packer, CAN, ccnc):
-  # Copy of the stock camera frame with only the hands-on warning and its chime removed. Every other
-  # signal, including the stock COUNTER, is copied verbatim; the packer recomputes the checksum.
+
+def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False):
+  # Copy of the stock camera frame with only the hands-on warning and its chime removed, and the LFA icon
+  # shown green while openpilot steers. Every other signal, including the stock COUNTER, is copied verbatim;
+  # the packer recomputes the checksum.
   values = dict(ccnc)
   if values.get("ALERTS_2") in CCNC_HANDS_ON_ALERTS:
     values["ALERTS_2"] = 0
     values["SOUNDS_2"] = 0
+  if lateral_active:
+    values["LFA_ICON"] = CCNC_LFA_ICON_ACTIVE
   return packer.make_can_msg("CCNC_0x161", CAN.ECAN, values)
 
 
