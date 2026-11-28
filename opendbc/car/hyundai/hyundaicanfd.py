@@ -106,12 +106,20 @@ CCNC_LFA_ICON_READY = 1
 # own cruise state (CAN-FD angle steering car, rlog 0000079b/0000079c 2026-11-27): main off 0/0/0 with set speed 255,
 # main on and not engaged 1/1/1 (gray), engaged 3/2/2. The stock camera only follows its own MAIN button, so with
 # openpilot longitudinal the cluster showed no cruise or LFA icon at all, also while openpilot drove (0000079d/0000079e).
+# Engaged, the stock camera also draws the gap spacing (DISTANCE_SPACING 1 in every engaged frame, 0 when ready;
+# rlog 00000798/0000079c/0000079f 2026-11-27/28). The stock camera enters its own engaged state only after its own
+# buttons (MAIN), so after an engage without them (0000079f: automatic engage, pedal resume) the copy kept spacing 0
+# and the cluster showed no gap while it did after a MAIN press.
 CCNC_CRUISE_READY = {"SETSPEED": 1, "SETSPEED_HUD": 1, "DISTANCE_CAR": 1}
-CCNC_CRUISE_ENGAGED = {"SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2}
+CCNC_CRUISE_ENGAGED = {"SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2, "DISTANCE_SPACING": 1}
+
+# CCNC_0x161 DISTANCE_LEAD (DBC VAL_ 353 DISTANCE_LEAD): 1 GRAY, 2 WHITE. With its own cruise engaged the stock camera
+# shows the lead it follows white (2); when ready it shows a seen lead at most gray (1) (same rlogs).
+CCNC_DISTANCE_LEAD_FOLLOWED = 2
 
 
 def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_hands_on=True, set_speed=None,
-                                 cruise_icons=None, distance_bars=0):
+                                 cruise_icons=None, distance_bars=0, lead_followed=False):
   # Copy of the stock camera frame with only the hands-on warning and its chime removed, the LFA icon
   # shown green while openpilot steers, and, with openpilot longitudinal, the cluster set speed
   # (SETSPEED_SPEED) replaced by the openpilot set speed in display units, packed like SCC_CONTROL VSetDis.
@@ -119,6 +127,7 @@ def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_
   # 30 km/h while openpilot and SCC_CONTROL VSetDis were 40 km/h).
   # cruise_icons (CCNC_CRUISE_READY or CCNC_CRUISE_ENGAGED) shows the openpilot longitudinal state instead of the
   # stock camera cruise state, with the openpilot gap bars (DISTANCE) and, unless openpilot steers, a gray LFA icon.
+  # lead_followed (openpilot longitudinal engaged with a lead) shows that lead white, as the engaged stock camera does.
   # Every other signal, including the stock COUNTER, is copied verbatim; the packer recomputes the checksum.
   values = dict(ccnc)
   if clear_hands_on and values.get("ALERTS_2") in CCNC_HANDS_ON_ALERTS:
@@ -129,6 +138,8 @@ def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_
     values["LFA_ICON"] = CCNC_LFA_ICON_READY
     if distance_bars > 0:
       values["DISTANCE"] = distance_bars
+    if lead_followed:
+      values["DISTANCE_LEAD"] = CCNC_DISTANCE_LEAD_FOLLOWED
   if lateral_active:
     values["LFA_ICON"] = CCNC_LFA_ICON_ACTIVE
   if set_speed is not None:

@@ -1095,6 +1095,18 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     # the last copy looked engaged: stock goes out first, then the gray copy again
     self.assertEqual(self._ccnc_display_cycles(6, 3, **self.CCNC_GRAY), [(True, False), (False, True), (False, True)])
 
+  def test_ccnc_engaged_gap_copy_needs_control(self):
+    self._ccnc_display_mode()
+    # KOVA 11/28: the engaged copy also shows the gap spacing and the followed lead (DISTANCE_SPACING, DISTANCE_LEAD),
+    # after an automatic engage too; with control it replaces the stock frame, without control it is not sent
+    engaged_gap = {**self.CCNC_GRAY, "SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2, "DISTANCE_SPACING": 1,
+                   "DISTANCE_LEAD": 2, "ALERTS_2": 0, "SOUNDS_2": 0}
+    self.safety.set_controls_allowed(True)
+    self.assertEqual(self._ccnc_display_cycles(1, 4, **engaged_gap)[1:], [(False, True)] * 3)
+    self.safety.set_controls_allowed(False)
+    for frame, name in enumerate(("DISTANCE_SPACING", "DISTANCE_LEAD"), start=5):
+      self.assertEqual(self._ccnc_display_cycles(frame, 1, **{**self.CCNC_GRAY, name: engaged_gap[name]}), [(True, False)], name)
+
 
 class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanfdAngleSteering):
 

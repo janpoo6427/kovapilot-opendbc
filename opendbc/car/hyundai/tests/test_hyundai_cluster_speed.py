@@ -115,7 +115,8 @@ class TestCcncSetSpeed(unittest.TestCase):
       before, after = bits(dat_stock), bits(copies[0][1])
       changed = {i for i in range(len(before)) if before[i] != after[i]}
       # KOVA 11/27 launch: the cruise icons now show the openpilot state too (engaged here, LFA gray without steering)
-      allowed = SET_SPEED_BITS | CRUISE_DISPLAY_BITS | CHECKSUM_BITS
+      # KOVA 11/28 gap display: engaged, the gap spacing too (DISTANCE_SPACING, bits 192..195)
+      allowed = SET_SPEED_BITS | CRUISE_DISPLAY_BITS | set(range(192, 196)) | CHECKSUM_BITS
       self.assertTrue(changed <= allowed, sorted(changed - allowed))
       self.assertEqual(sum(after[200 + i] << i for i in range(8)), int(set_kph))
       copy = signals(copies, 0x161, "CCNC_0x161")
