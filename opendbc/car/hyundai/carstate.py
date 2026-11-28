@@ -16,6 +16,16 @@ PREV_BUTTON_SAMPLES = 8
 # 50 ms on the IONIQ 9 camera bus (largest gap 62 ms in two 60 s drive segments, 2026-11-27).
 BLINDSPOT_FRESH_NS = 500_000_000
 CLUSTER_SAMPLE_RATE = 20  # frames
+# KOVA: CAN-FD cluster speed. CRUISE_BUTTONS_ALT CLUSTER_SPEED is the integer km/h shown on the instrument cluster
+# (IONIQ 9 rlogs 2026-11-27/28, ECAN every 20 ms: 3.0 km/h over the wheel speed at 70 km/h, 3.35 at 80-89, 3.6 at 90).
+# It is trusted only after it matched the wheel speed while moving, and dropped (wheel speed again) when it is
+# missing, stale, outside the plausible window, or the cluster is not in km/h.
+CLUSTER_SPEED_FRESH_NS = 500_000_000
+CLUSTER_SPEED_CONFIRM_FRAMES = 100
+CLUSTER_SPEED_CONFIRM_KPH = 10.
+CLUSTER_SPEED_MIN_DIFF_KPH = -3.
+CLUSTER_SPEED_MAX_DIFF_KPH = 7.
+CLUSTER_SPEED_MAX_DIFF_RATIO = 0.1
 STANDSTILL_THRESHOLD = 12 * 0.03125
 
 # Cancel button can sometimes be ACC pause/resume button, main button can also enable on some cars
@@ -67,6 +77,7 @@ class CarState(CarStateBase):
     # On some cars, CLU15->CF_Clu_VehicleSpeed can oscillate faster than the dash updates. Sample at 5 Hz
     self.cluster_speed = 0
     self.cluster_speed_counter = CLUSTER_SAMPLE_RATE
+    self.canfd_cluster_speed_frames = 0
 
     self.params = CarControllerParams(CP)
 
@@ -74,6 +85,22 @@ class CarState(CarStateBase):
   def blindspot_fresh(cp, msg: str, sig: str) -> bool:
     seen = cp.ts_nanos[msg][sig]
     return seen > 0 and 0 <= cp._last_update_nanos - seen <= BLINDSPOT_FRESH_NS
+
+  def canfd_cluster_speed(self, cp, ret) -> float:
+    """KOVA: vEgoCluster on CAN-FD from CRUISE_BUTTONS_ALT CLUSTER_SPEED, else the wheel speed (as before)."""
+    cluster_kph = cp.vl["CRUISE_BUTTONS_ALT"]["CLUSTER_SPEED"]
+    seen = cp.ts_nanos["CRUISE_BUTTONS_ALT"]["CLUSTER_SPEED"]
+    fresh = seen > 0 and 0 <= cp._last_update_nanos - seen <= CLUSTER_SPEED_FRESH_NS
+    wheel_kph = ret.vEgoRaw * CV.MS_TO_KPH
+    diff_kph = cluster_kph - wheel_kph
+    plausible = CLUSTER_SPEED_MIN_DIFF_KPH <= diff_kph <= max(CLUSTER_SPEED_MAX_DIFF_KPH, CLUSTER_SPEED_MAX_DIFF_RATIO * wheel_kph)
+    if not (self.is_metric and fresh and plausible):
+      self.canfd_cluster_speed_frames = 0
+    elif wheel_kph >= CLUSTER_SPEED_CONFIRM_KPH:
+      self.canfd_cluster_speed_frames = min(self.canfd_cluster_speed_frames + 1, CLUSTER_SPEED_CONFIRM_FRAMES)
+    if self.canfd_cluster_speed_frames >= CLUSTER_SPEED_CONFIRM_FRAMES:
+      return cluster_kph * CV.KPH_TO_MS
+    return ret.vEgo
 
   def recent_button_interaction(self) -> bool:
     # On some newer model years, the CANCEL button acts as a pause/resume button based on the PCM state
@@ -246,6 +273,8 @@ class CarState(CarStateBase):
     )
     ret.standstill = cp.vl["WHEEL_SPEEDS"]["WHL_SpdFLVal"] <= STANDSTILL_THRESHOLD and cp.vl["WHEEL_SPEEDS"]["WHL_SpdFRVal"] <= STANDSTILL_THRESHOLD and \
                      cp.vl["WHEEL_SPEEDS"]["WHL_SpdRLVal"] <= STANDSTILL_THRESHOLD and cp.vl["WHEEL_SPEEDS"]["WHL_SpdRRVal"] <= STANDSTILL_THRESHOLD
+
+    ret.vEgoCluster = self.canfd_cluster_speed(cp, ret)
 
     ret.steeringRateDeg = cp.vl["STEERING_SENSORS"]["STEERING_RATE"]
     ret.steeringAngleDeg = cp.vl["STEERING_SENSORS"]["STEERING_ANGLE"]
