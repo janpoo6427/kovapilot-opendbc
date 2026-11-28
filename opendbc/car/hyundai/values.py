@@ -162,6 +162,9 @@ class HyundaiFlags(IntFlag):
   # Passive evidence matches a typed CAN-FD longitudinal profile. This is a
   # candidate flag only and does not enable longitudinal control or safety.
   CANFD_LONGITUDINAL_CANDIDATE = 2 ** 29
+  # The front radar object list (group 3, 0x400-0x41D, 24 bytes) is on the A-CAN.
+  # Set from the fingerprint only; radar points are then parsed and radarUnavailable is False.
+  CANFD_RADAR_GROUP3 = 2 ** 30
 
 
 @dataclass

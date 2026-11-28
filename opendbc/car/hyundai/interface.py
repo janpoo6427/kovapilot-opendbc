@@ -2,7 +2,7 @@ from opendbc.car import Bus, get_safety_config, structs, uds
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import (CANFD_ANGLE_LONGITUDINAL_PROFILE, CANFD_ANGLE_STEERING_PROFILE, CAR, DBC,
                                        HyundaiCanFDEcuDisableStrategy, HyundaiFlags, HyundaiSafetyFlags)
-from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
+from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR, group3_present
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
 from opendbc.car.hyundai.carcontroller import CarController
@@ -66,6 +66,10 @@ class CarInterface(CarInterfaceBase):
       if lka_steering and Ecu.adas not in [fw.ecu for fw in car_fw]:
         # this needs to be figured out for cars without an ADAS ECU
         ret.alphaLongitudinalAvailable = False
+
+      # front radar object list (group 3): only when every slot was seen with its CAN-FD length
+      if group3_present(fingerprint.get(CAN.ACAN, {})):
+        ret.flags |= HyundaiFlags.CANFD_RADAR_GROUP3.value
 
       if 0x1ba in fingerprint[CAN.ECAN]:
         ret.flags |= HyundaiFlags.HAS_BSM.value
@@ -158,7 +162,10 @@ class CarInterface(CarInterfaceBase):
 
     # Common longitudinal control setup
 
-    ret.radarUnavailable = RADAR_START_ADDR not in fingerprint[1] or Bus.radar not in DBC[ret.carFingerprint]
+    if ret.flags & HyundaiFlags.CANFD_RADAR_GROUP3:
+      ret.radarUnavailable = False
+    else:
+      ret.radarUnavailable = RADAR_START_ADDR not in fingerprint[1] or Bus.radar not in DBC[ret.carFingerprint]
     ret.openpilotLongitudinalControl = alpha_long and ret.alphaLongitudinalAvailable
     ret.pcmCruise = not ret.openpilotLongitudinalControl
     ret.longitudinalActuatorDelay = 0.5
