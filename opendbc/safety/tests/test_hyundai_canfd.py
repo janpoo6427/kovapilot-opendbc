@@ -992,7 +992,8 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
   CCNC_STOCK_OFF = {"SETSPEED": 0, "SETSPEED_HUD": 0, "DISTANCE_CAR": 0, "DISTANCE": 0, "SETSPEED_SPEED": 255, "LFA_ICON": 0,
                     "LKA_ICON": 3, "ALERTS_2": 1, "SOUNDS_2": 2, "FCA_ICON": 1, "HDA_ICON": 1}
   CCNC_GRAY = {"SETSPEED": 1, "SETSPEED_HUD": 1, "DISTANCE_CAR": 1, "DISTANCE": 4, "SETSPEED_SPEED": 40, "LFA_ICON": 1}
-  CCNC_DISPLAY_SIGNALS = ("CHECKSUM", "SETSPEED", "SETSPEED_HUD", "DISTANCE_CAR", "DISTANCE", "SETSPEED_SPEED", "LFA_ICON")
+  CCNC_DISPLAY_SIGNALS = ("CHECKSUM", "SETSPEED", "SETSPEED_HUD", "DISTANCE_CAR", "DISTANCE", "SETSPEED_SPEED", "LFA_ICON",
+                          "NAV_ICON")
   # panda reads the stock CCNC_0x161 frame (the reference for copies without control) only with openpilot longitudinal
   CCNC_DISPLAY_WITHOUT_CONTROL = False
 
@@ -1042,7 +1043,8 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
   def test_ccnc_copy_without_control_no_engaged_icons(self):
     self._ccnc_display_mode()
     # without control the copy may not look engaged
-    for name, value in (("SETSPEED", 2), ("SETSPEED", 3), ("SETSPEED_HUD", 2), ("DISTANCE_CAR", 2), ("LFA_ICON", 2), ("LFA_ICON", 5)):
+    for name, value in (("SETSPEED", 2), ("SETSPEED", 3), ("SETSPEED_HUD", 2), ("DISTANCE_CAR", 2), ("LFA_ICON", 2), ("LFA_ICON", 5),
+                        ("NAV_ICON", 2), ("NAV_ICON", 4)):
       self._reset_safety_hooks()
       self._after_safety_reset()
       self.assertEqual(self._ccnc_display_cycles(1, 3, **self.CCNC_GRAY)[1:], [(False, True)] * 2, (name, value))
@@ -1106,6 +1108,23 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     self.safety.set_controls_allowed(False)
     for frame, name in enumerate(("DISTANCE_SPACING", "DISTANCE_LEAD"), start=5):
       self.assertEqual(self._ccnc_display_cycles(frame, 1, **{**self.CCNC_GRAY, name: engaged_gap[name]}), [(True, False)], name)
+
+  def test_ccnc_nav_icon_copy(self):
+    self._ccnc_display_mode()
+    # KOVA 11/28: the copy shows the NAV icon gray while ready (also over a hidden or green stock icon) and green only
+    # while engaged with navigation info; gray or hidden goes out without control, green or white only with control
+    self.safety.set_controls_allowed(False)
+    for frame, nav in enumerate((1, 0, 1), start=1):
+      self.assertEqual(self._ccnc_display_cycles(frame, 1, **{**self.CCNC_GRAY, "NAV_ICON": nav})[0][1], frame > 1, nav)
+    for i, nav in enumerate((2, 4, 3, 15)):
+      # blocked; the held-back stock frame is lost once, then stock goes out until a gray copy again
+      self.assertEqual(self._ccnc_display_cycles(4 + 3 * i, 1, **{**self.CCNC_GRAY, "NAV_ICON": nav}), [(False, False)], nav)
+      self.assertEqual(self._ccnc_display_cycles(5 + 3 * i, 2, **{**self.CCNC_GRAY, "NAV_ICON": 1}), [(True, False), (False, True)], nav)
+    self.assertFalse(self.safety.get_controls_allowed())
+    engaged = {**self.CCNC_GRAY, "SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2, "DISTANCE_SPACING": 1, "NAV_ICON": 2,
+               "ALERTS_2": 0, "SOUNDS_2": 0}
+    self.safety.set_controls_allowed(True)
+    self.assertEqual(self._ccnc_display_cycles(16, 3, **engaged), [(False, True)] * 3)
 
 
 class TestHyundaiCanfdAngleSteeringLong(HyundaiLongitudinalBase, TestHyundaiCanfdAngleSteering):

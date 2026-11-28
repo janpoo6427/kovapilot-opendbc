@@ -93,10 +93,10 @@ static void hyundai_canfd_pedal_resume(bool pedal_edge) {
 static bool hyundai_canfd_ccnc_display_only(const CANPacket_t *msg) {
   // CCNC_0x161 bits that may change, per byte: CHECKSUM (bytes 0-1, checked on its own), SETSPEED_HUD (byte 22 bits 5-7),
   // DISTANCE_CAR (byte 23 bits 5-7), DISTANCE gap bars (byte 24 bits 4-7), SETSPEED_SPEED (byte 25),
-  // SETSPEED (byte 26 bits 0-3), LFA_ICON (byte 28 bits 0-3)
+  // SETSPEED (byte 26 bits 0-3), NAV_ICON (byte 27 bits 4-7), LFA_ICON (byte 28 bits 0-3)
   static const uint8_t HYUNDAI_CANFD_CCNC_DISPLAY_BITS[32] = {
     0xFFU, 0xFFU, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U,
-    0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0xE0U, 0xE0U, 0xF0U, 0xFFU, 0x0FU, 0x00U, 0x0FU, 0x00U, 0x00U, 0x00U,
+    0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0xE0U, 0xE0U, 0xF0U, 0xFFU, 0x0FU, 0xF0U, 0x0FU, 0x00U, 0x00U, 0x00U,
   };
   uint8_t diff = 0U;
   for (uint8_t i = 0U; i < 32U; i++) {
@@ -105,8 +105,10 @@ static bool hyundai_canfd_ccnc_display_only(const CANPacket_t *msg) {
   const uint8_t setspeed_hud = (msg->data[22] >> 5U) & 0x7U;
   const uint8_t distance_car = (msg->data[23] >> 5U) & 0x7U;
   const uint8_t setspeed = msg->data[26] & 0xFU;
+  const uint8_t nav_icon = (msg->data[27] >> 4U) & 0xFU;
   const uint8_t lfa_icon = msg->data[28] & 0xFU;
-  const bool gray_icons = (setspeed_hud <= 1U) && (distance_car <= 1U) && (setspeed <= 1U) && (lfa_icon <= 1U);
+  const bool gray_icons = (setspeed_hud <= 1U) && (distance_car <= 1U) && (setspeed <= 1U) && (nav_icon <= 1U) &&
+                          (lfa_icon <= 1U);
   return safety.hyundai_ccnc_stock_valid && (diff == 0U) && gray_icons;
 }
 

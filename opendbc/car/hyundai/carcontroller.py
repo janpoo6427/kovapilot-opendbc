@@ -372,7 +372,8 @@ class CarController(CarControllerBase):
       # gray cruise and LFA icons while cruise is available but not engaged (from ignition on), the engaged
       # icons while engaged (also at standstill, when lateral pauses), with the openpilot set speed and gap bars,
       # and the gap spacing and followed lead as the engaged stock camera draws them, also after an engage without
-      # the stock camera buttons (automatic engage).
+      # the stock camera buttons (automatic engage). The NAV icon is green while engaged with navigation info
+      # (hudControl.navigationActive), gray otherwise.
       # The hands-on warning and the green LFA icon change only while openpilot steers; without control authority
       # panda passes only copies that differ from the stock frame in these gray icons, set speed and gap bars.
       # panda forwards the stock frame instead when this copy is missing, late or older than 150 ms.
@@ -389,7 +390,8 @@ class CarController(CarControllerBase):
           self.packer, self.CAN, CS.ccnc_161, CC.latActive and self.lateral_hud_enabled(CC),
           clear_hands_on=CC.latActive, set_speed=ccnc_set_speed if cruise_icons is not None else None,
           cruise_icons=cruise_icons, distance_bars=hud_control.leadDistanceBars,
-          lead_followed=long_engaged and hud_control.leadVisible))
+          lead_followed=long_engaged and hud_control.leadVisible,
+          navigation_active=long_engaged and hud_control.navigationActive))
       self.ccnc_161_nanos_last = ccnc_161_nanos
     else:
       can_sends.extend(hyundaicanfd.create_steering_messages(self.packer, self.CP, self.CAN, self.lateral_hud_enabled(CC),

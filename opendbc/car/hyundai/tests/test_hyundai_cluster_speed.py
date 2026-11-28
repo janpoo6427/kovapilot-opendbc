@@ -16,8 +16,10 @@ from opendbc.car.hyundai.tests import test_hyundai
 
 # SETSPEED_SPEED is bits 200..207
 SET_SPEED_BITS = set(range(200, 208))
-# cruise display fields shown from the openpilot cruise state: SETSPEED_HUD, DISTANCE_CAR, DISTANCE, SETSPEED, LFA_ICON
-CRUISE_DISPLAY_BITS = set(range(181, 184)) | set(range(189, 192)) | set(range(196, 200)) | set(range(208, 212)) | set(range(224, 228))
+# cruise display fields shown from the openpilot cruise state: SETSPEED_HUD, DISTANCE_CAR, DISTANCE, SETSPEED, NAV_ICON
+# (KOVA 11/28), LFA_ICON
+CRUISE_DISPLAY_BITS = (set(range(181, 184)) | set(range(189, 192)) | set(range(196, 200)) | set(range(208, 212)) |
+                       set(range(220, 224)) | set(range(224, 228)))
 GRAY = {"SETSPEED": 1, "SETSPEED_HUD": 1, "DISTANCE_CAR": 1, "LFA_ICON": 1}
 ENGAGED = {"SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2}
 STOCK_OFF = {"SETSPEED": 0, "SETSPEED_HUD": 0, "DISTANCE_CAR": 0, "DISTANCE": 0, "SETSPEED_SPEED": 255, "LFA_ICON": 0}

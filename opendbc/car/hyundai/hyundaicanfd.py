@@ -117,9 +117,19 @@ CCNC_CRUISE_ENGAGED = {"SETSPEED": 3, "SETSPEED_HUD": 2, "DISTANCE_CAR": 2, "DIS
 # shows the lead it follows white (2); when ready it shows a seen lead at most gray (1) (same rlogs).
 CCNC_DISTANCE_LEAD_FOLLOWED = 2
 
+# CCNC_0x161 NAV_ICON (DBC VAL_ 353 NAV_ICON): 0 HIDDEN, 1 GRAY, 2 GREEN, 4 WHITE. The stock camera shows it only on
+# roads the car navigation reports as controlled access (HDA_INFO 0x4A3 LinkClass 1 or 2): gray with its own cruise
+# ready, green (white with HDA white) when engaged, hidden elsewhere and with its cruise off (IONIQ 9 rlogs
+# 00000798~0000079e 2026-11-27, 108 segments: ready 27492 of 27493 frames gray on LinkClass 1/2, 16167 hidden on
+# other roads; engaged 30953 of 31002 green or white on LinkClass 1/2, 21812 hidden elsewhere). With openpilot
+# longitudinal the copy shows it green while openpilot longitudinal is engaged and navigation info is received
+# (car navigation or a navigation app, hudControl.navigationActive), gray otherwise, like the cruise icons.
+CCNC_NAV_ICON_ACTIVE = 2
+CCNC_NAV_ICON_READY = 1
+
 
 def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_hands_on=True, set_speed=None,
-                                 cruise_icons=None, distance_bars=0, lead_followed=False):
+                                 cruise_icons=None, distance_bars=0, lead_followed=False, navigation_active=False):
   # Copy of the stock camera frame with only the hands-on warning and its chime removed, the LFA icon
   # shown green while openpilot steers, and, with openpilot longitudinal, the cluster set speed
   # (SETSPEED_SPEED) replaced by the openpilot set speed in display units, packed like SCC_CONTROL VSetDis.
@@ -128,6 +138,8 @@ def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_
   # cruise_icons (CCNC_CRUISE_READY or CCNC_CRUISE_ENGAGED) shows the openpilot longitudinal state instead of the
   # stock camera cruise state, with the openpilot gap bars (DISTANCE) and, unless openpilot steers, a gray LFA icon.
   # lead_followed (openpilot longitudinal engaged with a lead) shows that lead white, as the engaged stock camera does.
+  # With cruise_icons the NAV icon is green with navigation_active (openpilot longitudinal engaged and navigation
+  # info received), else gray.
   # Every other signal, including the stock COUNTER, is copied verbatim; the packer recomputes the checksum.
   values = dict(ccnc)
   if clear_hands_on and values.get("ALERTS_2") in CCNC_HANDS_ON_ALERTS:
@@ -140,6 +152,7 @@ def create_ccnc_hands_on_cleared(packer, CAN, ccnc, lateral_active=False, clear_
       values["DISTANCE"] = distance_bars
     if lead_followed:
       values["DISTANCE_LEAD"] = CCNC_DISTANCE_LEAD_FOLLOWED
+    values["NAV_ICON"] = CCNC_NAV_ICON_ACTIVE if navigation_active else CCNC_NAV_ICON_READY
   if lateral_active:
     values["LFA_ICON"] = CCNC_LFA_ICON_ACTIVE
   if set_speed is not None:
