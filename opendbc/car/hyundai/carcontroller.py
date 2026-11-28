@@ -1,10 +1,11 @@
+import math
 import numpy as np
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL, make_tester_present_msg, structs
 from opendbc.car.common.filter_simple import FirstOrderFilter
 from opendbc.car.lateral import (AngleSteeringLimitsVM, apply_driver_steer_torque_limits, apply_std_steer_angle_limits,
-                                 apply_steer_angle_limits_vm, common_fault_avoidance)
+                                 apply_steer_angle_limits_vm, common_fault_avoidance, MAX_LATERAL_ACCEL, MAX_LATERAL_JERK)
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.hyundaicanfd import CanBus
@@ -29,6 +30,17 @@ CANCEL_BUTTON_DELAY_FRAMES = 10
 # Active angle control holds the command at the 175 degree command limit instead of releasing.
 ANGLE_ACTIVE_COMMAND_MAX = CarControllerParams.ANGLE_LIMITS.STEER_ANGLE_MAX
 ANGLE_MAX_MEASURED_ERROR = 8.0
+# While the driver turns the wheel hard (driver torque from the gain shelf end to the gain floor), the command
+# follows the measured angle this closely instead, about the tracking error without the driver
+# (79f-54, 57, 58, 85, 86, 87 rlog, active frames without steeringPressed: 99th percentile 0.9 to 2.6 degrees).
+ANGLE_DRIVER_MEASURED_ERROR = 2.0
+# Vehicle model values of panda HYUNDAI_CANFD_ANGLE_PARAMS (safety/modes/hyundai_canfd.h), used by panda for every
+# CAN-FD angle steering car, and a margin under its lateral accel limit for a late wheel speed sample.
+# Only frames past these limits change; the controller limits above stay as they are.
+ANGLE_SAFETY_SLIP_FACTOR = -0.0005358728290930592
+ANGLE_SAFETY_STEER_RATIO = 16.02
+ANGLE_SAFETY_WHEELBASE = 3.13
+ANGLE_SAFETY_MARGIN = 0.5  # deg
 # Only a driver who turns the wheel past the command limit plus the measured error ends active control.
 ANGLE_ACTIVE_MEASURED_MAX = ANGLE_ACTIVE_COMMAND_MAX + ANGLE_MAX_MEASURED_ERROR
 ANGLE_ENGAGE_GRACE_FRAMES = 50
@@ -73,16 +85,21 @@ def get_hyundai_angle_gain_limits(v_ego):
   return ceiling, shelf, floor
 
 
+def get_hyundai_angle_torque_points(v_ego):
+  # driver torque where the gain leaves the ceiling, reaches the shelf, leaves the shelf and reaches the floor
+  return (
+    float(np.interp(v_ego, [2.0, 11.0], [75.0, 125.0])),
+    float(np.interp(v_ego, [2.0, 11.0], [125.0, 150.0])),
+    float(np.interp(v_ego, [2.0, 11.0], [175.0, 275.0])),
+    float(np.interp(v_ego, [2.0, 22.0], [400.0, 700.0])),
+  )
+
+
 def update_hyundai_angle_torque_reduction_gain(steering_torque, v_ego, authority_requested, gain_last,
                                                recovery_time=ANGLE_GAIN_RECOVERY_TIME):
   ceiling, shelf, floor = get_hyundai_angle_gain_limits(v_ego)
   if authority_requested:
-    torque_points = (
-      float(np.interp(v_ego, [2.0, 11.0], [75.0, 125.0])),
-      float(np.interp(v_ego, [2.0, 11.0], [125.0, 150.0])),
-      float(np.interp(v_ego, [2.0, 11.0], [175.0, 275.0])),
-      float(np.interp(v_ego, [2.0, 22.0], [400.0, 700.0])),
-    )
+    torque_points = get_hyundai_angle_torque_points(v_ego)
     target = float(np.interp(abs(steering_torque), torque_points, [ceiling, shelf, shelf, floor]))
   else:
     target = 0.0
@@ -92,6 +109,21 @@ def update_hyundai_angle_torque_reduction_gain(steering_torque, v_ego, authority
   rate_up = (ceiling - floor) * DT_CTRL / recovery_time
   gain = float(np.clip(target, gain_last - ANGLE_GAIN_DOWN_RATE, gain_last + rate_up))
   return float(np.clip(gain, 0.0, 1.0))
+
+
+def update_hyundai_angle_measured_error(steering_torque, v_ego, authority_requested, error_last,
+                                        recovery_time=ANGLE_GAIN_RECOVERY_TIME):
+  """How far the command may stay from the measured angle. With driver torque below the gain shelf end it is
+  ANGLE_MAX_MEASURED_ERROR, as before. Past the shelf end it narrows with the torque, to ANGLE_DRIVER_MEASURED_ERROR
+  at the gain floor torque, so the MDPS does not hold the wheel 8 degrees away from where the driver turns it.
+  It narrows at once (the angle rate limits still move the command) and widens back over the gain recovery time,
+  so the command returns to the request as smoothly as the gain comes back."""
+  target = ANGLE_MAX_MEASURED_ERROR
+  if authority_requested:
+    _, _, shelf_end, floor_start = get_hyundai_angle_torque_points(v_ego)
+    target = float(np.interp(abs(steering_torque), [shelf_end, floor_start], [ANGLE_MAX_MEASURED_ERROR, ANGLE_DRIVER_MEASURED_ERROR]))
+  rate_up = (ANGLE_MAX_MEASURED_ERROR - ANGLE_DRIVER_MEASURED_ERROR) * DT_CTRL / recovery_time
+  return float(np.clip(target, ANGLE_DRIVER_MEASURED_ERROR, error_last + rate_up))
 
 
 def quantize_hyundai_angle_gain(gain):
@@ -146,7 +178,19 @@ def get_hyundai_steering_output_can(angle_steering, angle_active, angle_torque_r
   return apply_torque
 
 
-def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle, lat_active, authority_allowed, VM=None):
+def get_hyundai_angle_safety_limits(v_ego_raw):
+  # What panda accepts at most while steering: the angle at its lateral accel limit and the angle step per frame at
+  # its lateral jerk limit, at the wheel speed minus its 1 m/s fudge. Panda takes the lowest of its recent wheel
+  # speed samples, which is not above the one of this frame.
+  speed = max(v_ego_raw - 1.0, 1.0)
+  curvature_to_angle = math.degrees(ANGLE_SAFETY_STEER_RATIO * (1.0 - ANGLE_SAFETY_SLIP_FACTOR * speed * speed) * ANGLE_SAFETY_WHEELBASE)
+  max_angle = MAX_LATERAL_ACCEL / (speed * speed) * curvature_to_angle
+  max_angle_delta = MAX_LATERAL_JERK / (speed * speed) * curvature_to_angle * DT_CTRL
+  return max_angle, max_angle_delta
+
+
+def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle, lat_active, authority_allowed, VM=None,
+                               measured_error=ANGLE_MAX_MEASURED_ERROR):
   # At the command limit the command is held there, not released. Past 175 + 8 degrees measured the
   # command can not stay inside both the limit and the measured error, so control becomes inactive.
   angle_active = lat_active and authority_allowed and abs(measured_angle) <= ANGLE_ACTIVE_MEASURED_MAX
@@ -158,9 +202,22 @@ def apply_hyundai_angle_limits(requested_angle, apply_angle_last, v_ego, measure
   apply_angle = apply_std_steer_angle_limits(requested_angle, apply_angle_last, v_ego, measured_angle,
                                              angle_active, CarControllerParams.ANGLE_LIMITS)
   if angle_active:
-    apply_angle = float(np.clip(apply_angle, measured_angle - ANGLE_MAX_MEASURED_ERROR,
-                                measured_angle + ANGLE_MAX_MEASURED_ERROR))
+    apply_angle = float(np.clip(apply_angle, measured_angle - measured_error, measured_angle + measured_error))
     apply_angle = float(np.clip(apply_angle, -ANGLE_ACTIVE_COMMAND_MAX, ANGLE_ACTIVE_COMMAND_MAX))
+  if angle_active and VM is not None:
+    # The measured error clip can move the command past the panda lateral accel limit (the driver holds the wheel
+    # past it) or by more than the lateral jerk step (the wheel turns faster than it). Panda blocks such a frame
+    # and restarts its rate limit from the measured angle, so it keeps blocking while the command stays away from
+    # the measured angle, and the MDPS faults without commands (79f-85: 3.9 s blocked, MDPS fault 3.5 s). Keep
+    # the command inside both limits, and stop steering for the frame when that leaves it past the measured error.
+    max_angle, max_angle_delta = get_hyundai_angle_safety_limits(v_ego)
+    max_angle -= ANGLE_SAFETY_MARGIN
+    lowest = max(apply_angle_last - max_angle_delta, -max_angle)
+    highest = min(apply_angle_last + max_angle_delta, max_angle)
+    apply_angle = float(np.clip(apply_angle, lowest, highest))
+    if lowest > highest or abs(apply_angle - measured_angle) > ANGLE_MAX_MEASURED_ERROR:
+      angle_active = False
+      apply_angle = float(np.clip(measured_angle, -ANGLE_ACTIVE_COMMAND_MAX, ANGLE_ACTIVE_COMMAND_MAX))
   return apply_angle, angle_active
 
 
@@ -204,6 +261,7 @@ class CarController(CarControllerBase):
     self.angle_vm = VehicleModel(CP)
     self.angle_torque_reduction_gain = 0.0
     self.angle_gain = 0.0
+    self.angle_measured_error = ANGLE_MAX_MEASURED_ERROR
     self.angle_gain_recovery = HyundaiAngleGainRecovery()
     self.angle_active = False
     self.angle_engage_frames = 0
@@ -244,6 +302,9 @@ class CarController(CarControllerBase):
         CS.out.steeringTorque, CS.out.vEgoRaw, lateral_authorized, self.angle_gain, recovery_time,
       )
       self.angle_torque_reduction_gain = quantize_hyundai_angle_gain(self.angle_gain)
+      self.angle_measured_error = update_hyundai_angle_measured_error(
+        CS.out.steeringTorque, CS.out.vEgoRaw, lateral_authorized, self.angle_measured_error, recovery_time,
+      )
       if authority_allowed:
         self.angle_filter.update_alpha(float(np.interp(CS.out.vEgo, ANGLE_FILTER_RC_BP, ANGLE_FILTER_RC_V)))
         requested_angle = self.angle_filter.update(actuators.steeringAngleDeg)
@@ -252,7 +313,7 @@ class CarController(CarControllerBase):
         requested_angle = CS.out.steeringAngleDeg
       apply_angle, self.angle_active = apply_hyundai_angle_limits(
         requested_angle, self.apply_angle_last, CS.out.vEgoRaw,
-        CS.out.steeringAngleDeg, angle_engage_ready, authority_allowed, self.angle_vm,
+        CS.out.steeringAngleDeg, angle_engage_ready, authority_allowed, self.angle_vm, self.angle_measured_error,
       )
       self.apply_angle_last = apply_angle
 

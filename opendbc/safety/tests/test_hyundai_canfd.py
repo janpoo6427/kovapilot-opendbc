@@ -665,6 +665,49 @@ class TestHyundaiCanfdAngleSteering(HyundaiButtonBase, HyundaiAlwaysOnLateralBas
     self._set_prev_desired_angle(10.1)
     self.assertFalse(self._tx(self._angle_cmd_msg(10.1, True)))
 
+  # 79f-85 rlog 38665.2 to 38675.0 (every 0.1 to 0.4 s): seconds, measured angle, driver torque, request, km/h.
+  # The driver turned the wheel 20 degrees past the request and past the lateral accel limit; panda blocked the
+  # commands, which sat 8 degrees off the measured angle, for 3.9 s and the MDPS faulted.
+  DRIVER_PAST_LIMIT_TRACE = (
+    (0.0, -34.4, -615, -34.4, 58.1), (0.4, -35.8, -728, -35.1, 58.1), (0.8, -38.1, -807, -35.9, 58.2),
+    (1.2, -41.0, -799, -38.6, 58.4), (1.6, -42.0, -858, -42.1, 58.5), (1.9, -48.0, -869, -43.0, 58.4),
+    (2.2, -46.0, -753, -42.7, 58.5), (2.6, -47.2, -857, -46.7, 58.6), (3.0, -50.5, -923, -47.9, 58.3),
+    (3.3, -53.3, -920, -48.6, 57.8), (3.6, -56.6, -913, -49.7, 57.0), (3.9, -59.7, -891, -51.0, 56.2),
+    (4.2, -65.4, -915, -52.8, 55.1), (4.5, -65.8, -819, -54.2, 54.3), (4.8, -73.4, -691, -56.6, 53.1),
+    (4.94, -78.3, -706, -57.5, 52.6), (5.2, -73.6, -571, -58.7, 52.1), (5.6, -66.6, -558, -60.5, 51.2),
+    (6.0, -67.0, -624, -62.8, 50.1), (6.4, -67.0, -664, -64.0, 49.7), (6.7, -72.8, -610, -65.4, 49.0),
+    (7.1, -70.1, -511, -66.7, 48.5), (7.5, -69.0, -455, -68.2, 48.0), (7.8, -67.1, -613, -68.3, 47.9),
+    (8.2, -64.5, -653, -68.1, 47.5), (8.6, -64.8, -595, -68.7, 47.5), (9.0, -65.6, -668, -69.9, 47.3),
+    (9.4, -63.1, -241, -69.8, 47.4), (9.8, -67.0, -790, -69.1, 47.7),
+  )
+
+  def test_controller_commands_pass_with_driver_past_lateral_accel_limit(self):
+    controller, CS, CC = hyundai_car_tests.TestHyundaiCanFDAngleCommand._angle_controller(58.1 / 3.6)
+    trace = np.array(self.DRIVER_PAST_LIMIT_TRACE)
+    self._reset_speed_measurement(58.1 / 3.6)
+    self._reset_angle_measurement(-34.4)
+    self.safety.set_controls_allowed(True)
+    self._set_prev_desired_angle(-34.4)
+    blocked = []
+    for frame in range(int(trace[-1, 0] * 100) + 100):
+      t = max(frame - 100, 0) / 100
+      measured, torque, request, kph = (float(np.interp(t, trace[:, 0], trace[:, i])) for i in range(1, 5))
+      if frame < 100:
+        torque = 0.0  # engage first
+      self.safety.set_timer(frame * 10000)
+      self._rx(self._speed_msg(kph / 3.6))
+      self._rx(self._angle_meas_msg(measured, MDPS_StrTqSnsrVal=torque))
+      CS.out.vEgo = CS.out.vEgoRaw = kph / 3.6
+      CS.out.steeringAngleDeg = round(measured, 1)
+      CS.out.steeringTorque = torque
+      CS.out.steeringPressed = abs(torque) > 250
+      CC.actuators.steeringAngleDeg = request
+      _, msgs = controller.update(CC.as_reader(), CS, 0)
+      lfa = next(dat for address, dat, _ in msgs if address == 0xCB)
+      if not self._tx(libsafety_py.make_CANPacket(0xCB, 0, lfa)):
+        blocked.append(round(t, 2))
+    self.assertEqual(blocked, [])
+
   def test_driver_torque_does_not_block_active_angle(self):
     # the controller lowers the MDPS torque ceiling instead of releasing; panda has no driver torque check
     for torque in (251, 600, -251, -600):

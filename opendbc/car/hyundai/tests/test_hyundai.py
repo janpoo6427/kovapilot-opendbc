@@ -11,7 +11,8 @@ from opendbc.car.fw_versions import build_fw_dict
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.carcontroller import (hyundai_angle_lateral_authorized, ANGLE_ENGAGE_GRACE_FRAMES, CarController,
                                                 HyundaiAngleGainRecovery, apply_hyundai_angle_limits,
-                                                get_hyundai_angle_gain_limits, get_hyundai_steering_output_can,
+                                                get_hyundai_angle_gain_limits, get_hyundai_angle_safety_limits,
+                                                get_hyundai_steering_output_can,
                                                 quantize_hyundai_angle_gain, update_hyundai_angle_engage,
                                                 update_hyundai_angle_torque_reduction_gain)
 from opendbc.car.hyundai.carstate import CarState
@@ -150,8 +151,12 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
 
     static_angle, active = apply_hyundai_angle_limits(50.0, 40.0, 35.0, 40.0, True, True)
     model_angle, model_active = apply_hyundai_angle_limits(50.0, 40.0, 35.0, 40.0, True, True, VM)
-    self.assertTrue(active and model_active)
-    self.assertLess(model_angle, static_angle)
+    self.assertTrue(active)
+    self.assertGreater(static_angle, 40.0)
+    # with the vehicle model, 40 degrees at 126 km/h is more than 8 degrees past the panda lateral accel limit
+    # (about 14 degrees): no command can pass panda, so control is inactive for the frame with the measured angle
+    self.assertFalse(model_active)
+    self.assertEqual(model_angle, 40.0)
 
     inactive_angle, inactive = apply_hyundai_angle_limits(-50.0, model_angle, 35.0, 17.0, True, False, VM)
     self.assertFalse(inactive)
@@ -295,6 +300,74 @@ class TestHyundaiCanFDAngleCommand(unittest.TestCase):
       self.assertTrue(active)
       self.assertGreater(gain, 0)
       self.assertEqual(actuators.steeringAngleDeg, sign * 175.0)
+
+  def test_angle_hard_driver_steering_follows_measured_angle(self):
+    # The driver turns the wheel past the request with 900 torque (past the gain floor torque):
+    # the command follows the measured angle within 2 degrees instead of holding 8 degrees away from it
+    for sign in (1, -1):
+      controller, CS, CC = self._angle_controller(30 / 3.6)
+      self._run_angle_controller(controller, CS, CC, 100, request=sign * 30.0)
+      actuators, active, gain = self._run_angle_controller(controller, CS, CC, 100, request=sign * 30.0, torque=sign * 900.0,
+                                                           pressed=True, measured=sign * 40.0)
+      self.assertTrue(active)
+      self.assertGreater(gain, 0)
+      self.assertAlmostEqual(actuators.steeringAngleDeg, sign * 38.0, delta=0.01)
+
+  def test_angle_light_driver_torque_keeps_measured_error(self):
+    # below the gain shelf end torque (245 at 30 km/h) the command stays up to 8 degrees from the measured angle, as before
+    for torque, pressed in ((0.0, False), (200.0, False), (240.0, True)):
+      controller, CS, CC = self._angle_controller(30 / 3.6)
+      self._run_angle_controller(controller, CS, CC, 100, request=30.0)
+      actuators, active, _ = self._run_angle_controller(controller, CS, CC, 100, request=30.0, torque=torque, pressed=pressed,
+                                                        measured=40.0)
+      self.assertTrue(active)
+      self.assertAlmostEqual(actuators.steeringAngleDeg, 32.0, delta=0.01)
+
+  def test_angle_measured_error_widens_back_over_gain_recovery(self):
+    # after the driver lets go, the command returns to 8 degrees from the measured angle over the 0.5 s gain recovery, not at once
+    controller, CS, CC = self._angle_controller(30 / 3.6)
+    self._run_angle_controller(controller, CS, CC, 100, request=30.0)
+    self._run_angle_controller(controller, CS, CC, 100, request=30.0, torque=900.0, pressed=True, measured=40.0)
+    angle_last = controller.apply_angle_last
+    self.assertAlmostEqual(angle_last, 38.0, delta=0.01)
+    for frame in range(60):
+      actuators, active, _ = self._run_angle_controller(controller, CS, CC, 1, request=30.0, measured=40.0)
+      self.assertTrue(active)
+      self.assertLessEqual(angle_last - actuators.steeringAngleDeg, 6.0 / 50 + 1e-4)
+      angle_last = actuators.steeringAngleDeg
+      if frame < 45:
+        self.assertGreater(angle_last, 32.5)
+    self.assertAlmostEqual(angle_last, 32.0, delta=0.01)
+
+  def test_angle_command_stays_inside_panda_limits_with_driver_past_them(self):
+    # 79f-85, 55 km/h: the driver turns the wheel to 80 degrees, past the panda lateral accel limit (about 56 degrees)
+    # plus 8 degrees. Each active command stays inside that limit, one jerk step from the last command and 8 degrees
+    # from the measured angle (panda blocked 79f-85 commands 8 degrees off past the limit for 3.9 s, then the MDPS
+    # faulted). Where no command can, control is inactive for the frame with the measured angle and gain 0.
+    for sign in (1, -1):
+      speed = 55 / 3.6
+      controller, CS, CC = self._angle_controller(speed)
+      self._run_angle_controller(controller, CS, CC, 100, request=sign * 35.0, measured=sign * 35.0)
+      max_angle, max_angle_delta = get_hyundai_angle_safety_limits(speed)
+      angle_last = controller.apply_angle_last
+      states = []
+      for frame in range(400):
+        measured = sign * (35.0 + 45.0 * min(frame / 300, 1.0))
+        actuators, active, gain = self._run_angle_controller(controller, CS, CC, 1, request=sign * 55.0, torque=sign * 900.0,
+                                                             pressed=True, measured=measured)
+        angle = actuators.steeringAngleDeg
+        if active:
+          self.assertLessEqual(abs(angle), max_angle, frame)
+          self.assertLessEqual(abs(angle - angle_last), max_angle_delta + 1e-4, frame)
+          self.assertLessEqual(abs(angle - measured), 8.0 + 1e-4, frame)
+          self.assertGreater(gain, 0)
+        else:
+          self.assertAlmostEqual(angle, measured, delta=1e-4)
+          self.assertEqual(gain, 0)
+        states.append(active)
+        angle_last = angle
+      self.assertTrue(all(states[:100]))
+      self.assertFalse(any(states[-100:]))
 
   def test_angle_torque_output_reports_transmitted_authority(self):
     self.assertEqual(get_hyundai_steering_output_can(True, True, 0.6, 123), 150)
