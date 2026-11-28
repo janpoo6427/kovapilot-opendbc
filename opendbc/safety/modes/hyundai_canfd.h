@@ -80,7 +80,7 @@ static bool hyundai_canfd_pedal_resume_enabled(void) {
 }
 
 // ALT_EXP_PEDAL_RESUME: the driver's own pedal input seen here on the car bus, a brake release or
-// an accelerator press, re-allows controls while cruise is available. The host decides whether to engage.
+// an accelerator press or release, re-allows controls while cruise is available. The host decides whether to engage.
 static void hyundai_canfd_pedal_resume(bool pedal_edge) {
   if (pedal_edge && safety.acc_main_on && !safety.hyundai_pedal_resume_blocked && !safety.brake_pressed) {
     safety.controls_allowed = true;
@@ -213,8 +213,8 @@ static void hyundai_canfd_rx_hook(const CANPacket_t *msg) {
     gas_msg = true;
   }
   if (gas_msg && hyundai_canfd_pedal_resume_enabled()) {
-    // accelerator: the moment it is pressed
-    hyundai_canfd_pedal_resume(!safety.gas_pressed_prev && safety.gas_pressed);
+    // accelerator: the moment it is pressed or released
+    hyundai_canfd_pedal_resume(safety.gas_pressed_prev != safety.gas_pressed);
   }
 
   // brake press
